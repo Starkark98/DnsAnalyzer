@@ -6,8 +6,8 @@ Only the **latest release** of DNS Analyzer receives fixes. Please update before
 
 | Version | Supported |
 |---|---|
-| 1.0.x (latest) | Yes |
-| Older | No |
+| 1.1.x (latest) | Yes |
+| 1.0.x and older | No |
 
 ## Reporting a vulnerability
 

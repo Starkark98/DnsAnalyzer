@@ -28,6 +28,15 @@
   Does not ask for administrator rights at startup.
 .PARAMETER NoOpen
   Saves the dashboard without opening it in the browser (useful with -NoGui in scheduled tasks).
+.PARAMETER CompareWith
+  Target (new) server of a comparison. The source (old) is -DnsServer or -Baseline.
+.PARAMETER Baseline
+  Source of a comparison saved earlier: a baseline (.json, from -SaveBaseline or "Save baseline...") or an
+  analysis report of DNS Analyzer (.html).
+.PARAMETER SaveBaseline
+  After an analysis, also saves its data as a baseline file (.json) for later comparisons.
+.PARAMETER DemoCompare
+  Opens a comparison dashboard built from two sample servers with deliberate differences.
 
 .EXAMPLE
   .\DnsAnalyzer.ps1
@@ -35,6 +44,10 @@
   .\DnsAnalyzer.ps1 -Demo
 .EXAMPLE
   .\DnsAnalyzer.ps1 -DnsServer DC01 -NoGui -OutHtml C:\Reports\dns.html
+.EXAMPLE
+  .\DnsAnalyzer.ps1 -DnsServer DC01 -CompareWith DNS-NEW01 -NoGui
+.EXAMPLE
+  .\DnsAnalyzer.ps1 -DnsServer DC01 -NoGui -SaveBaseline C:\Reports\dc01-baseline.json
 
 .NOTES
   Author : Starkark98
@@ -53,19 +66,26 @@ param(
     [switch]$Demo,
     [string]$OutHtml,
     [switch]$NoElevate,
-    [switch]$NoOpen
+    [switch]$NoOpen,
+    [ValidatePattern('^[A-Za-z0-9_][A-Za-z0-9._:-]{0,252}$')]
+    [string]$CompareWith,
+    [string]$Baseline,
+    [string]$SaveBaseline,
+    [switch]$DemoCompare
 )
 
 $ErrorActionPreference = 'Stop'
 $AppName    = 'DNS Analyzer'
-$AppVersion = '1.0.0'
+$AppVersion = '1.1.0'
 
 # =============================================================================
 #  ANALYSIS ENGINE (runs in a background runspace)
 # =============================================================================
 $Collector = {
-    param($Server, $Scan, $ExtName, $Sync)
+    # $Light: configuration only (for comparisons and baselines) - no event logs, no statistics, no live tests
+    param($Server, $Scan, $ExtName, $Sync, $Light)
     $ErrorActionPreference = 'Stop'
+    if ($Light) { $Scan = $false }
     try {
         Import-Module DnsServer -ErrorAction Stop
 
@@ -75,6 +95,30 @@ $Collector = {
         function Sec($ts) { if ($ts -is [TimeSpan]) { [int64]$ts.TotalSeconds } else { 0 } }
         function Dt($d) { if ($d -is [datetime] -and $d.Year -gt 1601) { $d.ToString('yyyy-MM-dd HH:mm') } else { '' } }
         function Step($msg, $pct) { $Sync.Status = $msg; if ($null -ne $pct) { $Sync.Progress = [int]$pct } }
+        # Every simple property of a settings object, as text (used for "All settings" and for comparisons)
+        function Flat($o, [string[]]$skip = @()) {
+            if ($null -eq $o) { return $null }
+            $h = [ordered]@{}
+            foreach ($p in $o.PSObject.Properties) {
+                if ($p.Name -in $skip -or $p.Name -match '^(PSComputerName|ComputerName|Cim\w+|PSShowComputerName)$') { continue }
+                $v = $p.Value
+                if ($null -eq $v) { $h[$p.Name] = '' }
+                elseif ($v -is [TimeSpan]) { $h[$p.Name] = Span $v }
+                elseif ($v -is [datetime]) { $h[$p.Name] = Dt $v }
+                elseif ($v -is [string] -or $v -is [ValueType] -or $v -is [Net.IPAddress]) { $h[$p.Name] = "$v" }
+                elseif ($v -is [Collections.IEnumerable]) {
+                    $items = @($v | Where-Object { $_ -is [string] -or $_ -is [ValueType] -or $_ -is [Net.IPAddress] } | ForEach-Object { "$_" })
+                    if ($items.Count -or @($v).Count -eq 0) { $h[$p.Name] = ($items -join ', ') }
+                }
+            }
+            [pscustomobject]$h
+        }
+        # DNS policy (server or zone level) as plain text
+        function Pol($p, [string]$zone) {
+            [pscustomobject]@{ name = "$($p.Name)"; zone = $zone; kind = 'Query resolution'; action = "$($p.Action)"; enabled = [bool]$p.IsEnabled; order = [int]$p.ProcessingOrder
+                cond = "$($p.Condition)"; criteria = (@($p.Criteria | Where-Object { $_ } | ForEach-Object { "$($_.CriteriaType) $($_.Criteria)" }) -join '; ')
+                content = (@($p.Content | Where-Object { $_ } | ForEach-Object { "$($_.ScopeName)$(if ($_.Weight) { " ($($_.Weight))" })" }) -join ', ') }
+        }
         function Short([string]$m) { $m = (("$m" -split "`r?`n") | Where-Object { $_.Trim() } | Select-Object -First 1); if ("$m".Length -gt 160) { $m.Substring(0, 160) + '...' } else { "$m" } }
 
         # Record data as text, per record type
@@ -167,9 +211,27 @@ $Collector = {
         $gqbl  = Safe { Get-DnsServerGlobalQueryBlockList -ComputerName $Server }
         $rrl   = Safe { Get-DnsServerResponseRateLimiting -ComputerName $Server }
         $diag  = Safe { Get-DnsServerDiagnostics -ComputerName $Server }
-        $stat  = Safe { Get-DnsServerStatistics -ComputerName $Server }
+        $stat  = $(if (-not $Light) { Safe { Get-DnsServerStatistics -ComputerName $Server } })
         $svc   = Safe { Get-Service -ComputerName $Server -Name DNS }
         $fwdIps = @($fwd.IPAddress | Where-Object { $_ } | ForEach-Object { "$_" })
+
+        # More server-level configuration (each cmdlet may be missing on older servers: Safe returns nothing)
+        $edns    = Safe { Get-DnsServerEDns -ComputerName $Server }
+        $dsSet   = Safe { Get-DnsServerDsSetting -ComputerName $Server }
+        $gnz     = Safe { Get-DnsServerGlobalNameZone -ComputerName $Server }
+        $parts   = @(Safe { Get-DnsServerDirectoryPartition -ComputerName $Server } | Where-Object { $_ })
+        $rrlEx   = @(Safe { Get-DnsServerResponseRateLimitingExceptionlist -ComputerName $Server } | Where-Object { $_ })
+        $recSc   = @(Safe { Get-DnsServerRecursionScope -ComputerName $Server } | Where-Object { $_ })
+        $subnets = @(Safe { Get-DnsServerClientSubnet -ComputerName $Server } | Where-Object { $_ })
+        $qrp     = @(Safe { Get-DnsServerQueryResolutionPolicy -ComputerName $Server } | Where-Object { $_ })
+        $xfp     = @(Safe { Get-DnsServerZoneTransferPolicy -ComputerName $Server } | Where-Object { $_ })
+        $tps     = @(Safe { Get-DnsServerTrustPoint -ComputerName $Server } | Where-Object { $_ })
+        $cfg = [ordered]@{
+            'Server' = (Flat $set @('ListeningIPAddress', 'AllIPAddress')); 'Recursion' = (Flat $rec); 'Forwarders' = (Flat $fwd); 'Cache' = (Flat $cache)
+            'Scavenging' = (Flat $scav @('LastScavengeTime')); 'Global query block list' = (Flat $gqbl); 'Response rate limiting' = (Flat $rrl)
+            'EDNS' = (Flat $edns); 'Active Directory' = (Flat $dsSet); 'Global names zone' = (Flat $gnz); 'Diagnostics' = (Flat $diag)
+        }
+        foreach ($k in @($cfg.Keys)) { if ($null -eq $cfg[$k]) { $cfg.Remove($k) } }
 
         # Statistics: every numeric counter, flattened as "Group.Counter"
         $stc = [ordered]@{}; $stStart = ''
@@ -186,6 +248,8 @@ $Collector = {
         }
 
         # ---- Event logs (last 7 days) ----
+        $logInfo = $null
+        if (-not $Light) {
         Step 'Reading DNS event logs...' 8
         $since = (Get-Date).Date.AddDays(-6)
         $days = [ordered]@{}
@@ -230,6 +294,7 @@ $Collector = {
             days = @(foreach ($k in $days.Keys) { [pscustomobject]$days[$k] | Add-Member -NotePropertyName day -NotePropertyValue $k -PassThru })
             rows = @($auRows | Sort-Object time -Descending)
         }
+        }
 
         # ---- Live tests: server and forwarders ----
         $tests = @(); $fwdOut = @(); $nsCache = @{}
@@ -257,7 +322,8 @@ $Collector = {
         }
 
         # ---- Zones ----
-        $n = 0; $tot = [math]::Max($zl.Count, 1); $scanBudget = 4096; $nsBudget = 300
+        $n = 0; $tot = [math]::Max($zl.Count, 1); $scanBudget = 4096; $nsBudget = 300; $delegBudget = 200
+        $polOk = $set -and [int]$set.BuildNumber -ge 14393
         $zoneOut = foreach ($z in $zl) {
             $n++; $name = "$($z.ZoneName)"; $type = "$($z.ZoneType)"
             $base = 16 + [int](80 * ($n - 1) / $tot)
@@ -310,6 +376,42 @@ $Collector = {
                 $fwdTest = @(foreach ($m in $masters) { Q $name 'SOA' $m | Add-Member -NotePropertyName ip -NotePropertyValue $m -PassThru })
             }
 
+            # Delegations (NS records below the apex); with the live tests, do the delegated name servers answer?
+            $deleg = @(foreach ($g in @($rrs | Where-Object { "$($_.RecordType)" -eq 'NS' -and "$($_.HostName)" -ne '@' } | Group-Object { "$($_.HostName)".ToLower() })) {
+                $child = "$($g.Group[0].HostName).$name"
+                $dns = @(foreach ($r in $g.Group) { [pscustomobject]@{ name = "$($r.RecordData.NameServer)".TrimEnd('.'); ip = ''; tested = $false; ok = $false; dead = $false; ms = 0; err = '' } })
+                if ($Scan -and $delegBudget -gt 0) {
+                    $delegBudget--
+                    foreach ($x in $dns) {
+                        $x.tested = $true
+                        if (-not $nsCache.ContainsKey($x.name)) { $a = Q $x.name 'A' $Server; $nsCache[$x.name] = $(if ($a.ok -and $a.res) { "$($a.res)".Split(',')[0].Trim() } else { '' }) }
+                        $x.ip = $nsCache[$x.name]
+                        if (-not $x.ip) { $x.err = 'Name server name does not resolve to an IPv4 address'; continue }
+                        $t = Q $child 'SOA' $x.ip $true
+                        $x.ok = $t.ok; $x.dead = $t.dead; $x.ms = $t.ms; $x.err = $t.err
+                    }
+                }
+                [pscustomobject]@{ name = $child; ns = $dns }
+            })
+
+            # Zone scopes and DNS policies (Windows Server 2016 and later)
+            $zScopes = @(); $zPol = @()
+            if ($polOk -and $type -eq 'Primary' -and -not $z.IsAutoCreated) {
+                $zScopes = @(Safe { Get-DnsServerZoneScope -ComputerName $Server -ZoneName $name } | Where-Object { $_ -and "$($_.ZoneScope)" -ne $name } | ForEach-Object { "$($_.ZoneScope)" })
+                $zPol = @(Safe { Get-DnsServerQueryResolutionPolicy -ComputerName $Server -ZoneName $name } | Where-Object { $_ } | ForEach-Object { Pol $_ $name })
+                $zPol += @(Safe { Get-DnsServerZoneTransferPolicy -ComputerName $Server -ZoneName $name } | Where-Object { $_ } | ForEach-Object { $x = Pol $_ $name; $x.kind = 'Zone transfer'; $x })
+            }
+
+            # DNSSEC: signing keys and zone settings
+            $sec = $null
+            if ($z.IsSigned) {
+                $dz = Safe { Get-DnsServerDnsSecZoneSetting -ComputerName $Server -ZoneName $name }
+                $keys = @(Safe { Get-DnsServerSigningKey -ComputerName $Server -ZoneName $name } | Where-Object { $_ } | ForEach-Object {
+                    [pscustomobject]@{ id = "$($_.KeyId)"; type = "$($_.KeyType)"; algo = "$($_.CryptoAlgorithm)"; len = "$($_.KeyLength)"
+                        state = "$(P $_ 'CurrentState', 'KeyState')"; next = "$(P $_ 'NextRolloverAction')"; when = (Dt (P $_ 'NextRolloverTime')); period = (Span (P $_ 'RolloverPeriod')) } })
+                $sec = [pscustomobject]@{ settings = (Flat $dz @('ZoneName')); keys = $keys }
+            }
+
             # Liveness of static and stale A records (forward primary zones)
             $scanRes = $null
             if ($Scan -and $type -eq 'Primary' -and -not $z.IsReverseLookupZone -and -not $z.IsAutoCreated -and $scanBudget -gt 0) {
@@ -352,13 +454,21 @@ $Collector = {
                 scavAvail = $(if ($ag) { Dt $ag.AvailForScavengeTime } else { '' })
                 soa = $soa; ns = $ns; fwdTest = $fwdTest
                 total = $total; truncated = ($total -gt $cap); records = @($recs)
-                scan = $scanRes
+                scan = $scanRes; deleg = $deleg; scopes = $zScopes; pol = $zPol; dnssec = $sec
+                props = (Flat $z @('ZoneName', 'LastSuccessfulSOACheck', 'LastSuccessfulXfr', 'LastZoneTransferAttempt', 'LastZoneTransferResult', 'DistinguishedName'))
             }
         }
 
         Step 'Building dashboard...' 97
         $data = [pscustomobject]@{
-            server = $Server; generated = (Get-Date).ToString('yyyy-MM-dd HH:mm'); scanned = [bool]$Scan; demo = $false; extName = $ExtName
+            server = $Server; generated = (Get-Date).ToString('yyyy-MM-dd HH:mm'); scanned = [bool]$Scan; demo = $false; extName = $ExtName; light = [bool]$Light
+            cfg = [pscustomobject]$cfg
+            partitions = @($parts | ForEach-Object { [pscustomobject]@{ name = "$($_.DirectoryPartitionName)"; flags = "$($_.Flags)"; state = "$($_.State)"; zones = [int]$_.ZoneCount; replicas = @($_.Replica | Where-Object { $_ }).Count } })
+            policies = @(@($qrp | ForEach-Object { Pol $_ '' }) + @($xfp | ForEach-Object { $x = Pol $_ ''; $x.kind = 'Zone transfer'; $x }))
+            subnets = @($subnets | ForEach-Object { [pscustomobject]@{ name = "$($_.Name)"; v4 = (@($_.IPv4Subnet) -join ', '); v6 = (@($_.IPv6Subnet) -join ', ') } })
+            recScopes = @($recSc | ForEach-Object { [pscustomobject]@{ name = "$($_.Name)"; recursion = [bool]$_.EnableRecursion; fwd = (@($_.Forwarder | Where-Object { $_ } | ForEach-Object { "$_" }) -join ', ') } })
+            rrlEx = @($rrlEx | ForEach-Object { [pscustomobject]@{ name = "$($_.Name)"; fqdn = "$($_.Fqdn)"; subnet = "$($_.ClientSubnet)"; cond = "$($_.Condition)" } })
+            trustPoints = @($tps | ForEach-Object { [pscustomobject]@{ name = "$($_.TrustPointName)"; state = "$($_.TrustPointState)"; last = (Dt (P $_ 'LastActiveRefreshTime')); next = (Dt (P $_ 'NextActiveRefreshTime')) } })
             settings = [pscustomobject]@{
                 service = "$($svc.Status)"; startType = "$($svc.StartType)"
                 version = $(if ($set) { "$($set.MajorVersion).$($set.MinorVersion).$($set.BuildNumber)" } else { '' })
@@ -415,7 +525,8 @@ $Collector = {
 # =============================================================================
 #  DEMO DATA (realistic, fictitious)
 # =============================================================================
-function New-DemoData {
+# -Variant target: the same network after a migration to a new server, with deliberate differences (compare demo)
+function New-DemoData([string]$Variant = 'source') {
     $rnd = [Random]::new(2026)
     $now = Get-Date
     $dom = 'contoso.local'
@@ -430,7 +541,7 @@ function New-DemoData {
             paused = $false; shutdown = $false; signed = $false; file = ''; xfer = 'NoTransfer'; xferTo = @(); notify = 'NoNotify'
             masters = @(); useRec = $false; fwdTimeout = ''; lastSoa = ''; lastXfr = ''; xferRes = ''
             aging = $false; noRef = ''; refr = ''; staleDays = 14; scavAvail = ''; soa = $null; ns = @(); fwdTest = @()
-            total = 0; truncated = $false; records = @(); scan = $null }
+            total = 0; truncated = $false; records = @(); scan = $null; deleg = @(); scopes = @(); pol = @(); dnssec = $null; props = $null }
         foreach ($k in $h.Keys) { $z[$k] = $h[$k] }
         if ($z.type -ne 'Primary') { $z.aging = $null }
         $z.total = @($z.records).Count
@@ -451,6 +562,7 @@ function New-DemoData {
     $srv = [ordered]@{ 'srv-file01' = 20; 'srv-app01' = 21; 'srv-web01' = 22; 'srv-sql01' = 23; 'srv-print01' = 24; 'srv-backup01' = 25; 'srv-wsus01' = 26; 'srv-old-erp' = 30; 'nas01' = 31; 'srv-ca01' = 32; 'srv-vcenter' = 40; 'esx01' = 41; 'esx02' = 42; 'esx03' = 43 }
     foreach ($k in $srv.Keys) { $r1.Add((Rr $k 'A' "10.10.0.$($srv[$k])" 3600 '')) }
     $r1.Add((Rr 'intranet' 'CNAME' "srv-web01.$dom." 3600 '')); $r1.Add((Rr 'erp' 'CNAME' "srv-old-erp.$dom." 3600 ''))
+    $r1.Add((Rr 'lab' 'NS' "ns1.lab.$dom." 3600 '')); $r1.Add((Rr 'ns1.lab' 'A' '10.10.30.5' 3600 ''))
     $r1.Add((Rr 'wiki' 'CNAME' "srv-wiki01.$dom." 3600 '')); $r1.Add((Rr 'files' 'CNAME' "srv-file01.$dom." 3600 ''))
     $r1.Add((Rr 'wsus' 'CNAME' "srv-wsus01.$dom." 3600 '')); $r1.Add((Rr 'helpdesk' 'CNAME' "srv-helpdesk.$dom." 3600 ''))
     $r1.Add((Rr 'pki' 'CNAME' "srv-ca01.$dom." 3600 ''))
@@ -483,7 +595,8 @@ function New-DemoData {
         $scanIps.Add([pscustomobject]@{ ip = $g.Name; names = (@($g.Group.n) -join ', '); kind = 'stale'; cls = $(if ($live) { 'live' } else { 'dead' }); ping = $(if ($live) { $rnd.Next(1, 6) } else { '' }); tcp = ''; mac = '' })
     }
     $z1 = Zone @{ name = $dom; aging = $true; noRef = '7 d'; refr = '7 d'; staleDays = 14; scavAvail = (Ts 120); soa = (Soa "dc01.$dom" 2026101942 86400)
-        ns = $nsDc; records = @($r1); scan = [pscustomobject]@{ total = $scanIps.Count; ips = @($scanIps) } }
+        ns = $nsDc; records = @($r1); scan = [pscustomobject]@{ total = $scanIps.Count; ips = @($scanIps) }
+        deleg = @([pscustomobject]@{ name = "lab.$dom"; ns = @([pscustomobject]@{ name = "ns1.lab.$dom"; ip = '10.10.30.5'; tested = $true; ok = $false; dead = $true; ms = 2004; err = 'This operation returned because the timeout period expired' }) }) }
 
     # 2 - _msdcs: forest-wide locator zone
     $r2 = @((Rr '@' 'SOA' "dc01.$dom. hostmaster.$dom. 1187" 3600 ''), (Rr '@' 'NS' "dc01.$dom." 3600 ''), (Rr '@' 'NS' "dc02.$dom." 3600 ''),
@@ -513,8 +626,18 @@ function New-DemoData {
         (Rr '@' 'MX' '10 mail.contoso.com.' 3600 ''), (Rr 'mail' 'A' '203.0.113.25' 3600 ''), (Rr 'autodiscover' 'CNAME' 'mail.contoso.com.' 3600 ''),
         (Rr 'shop' 'CNAME' 'shop-old.contoso.com.' 3600 ''), (Rr '@' 'TXT' 'v=spf1 mx ip4:203.0.113.25 -all' 3600 ''), (Rr '_sip._tls' 'SRV' '100 1 443 sip.contoso.com.' 3600 ''),
         (Rr 'vpn' 'A' '203.0.113.30' 3600 ''))
+    function DPol([string]$name, [string]$zone, [string]$action, [bool]$on, [int]$order, [string]$crit, [string]$content) {
+        [pscustomobject]@{ name = $name; zone = $zone; kind = 'Query resolution'; action = $action; enabled = $on; order = $order; cond = 'And'; criteria = $crit; content = $content }
+    }
     $z4 = Zone @{ name = 'contoso.com'; ad = $false; repl = 'None'; part = ''; dyn = 'None'; file = 'contoso.com.dns'; xfer = 'TransferAnyServer'; notify = 'Notify'
-        soa = (Soa 'ns1.contoso.com' 2026101501 604800); records = $r4
+        soa = (Soa 'ns1.contoso.com' 2026101501 604800); records = $r4; signed = $true; scopes = @('EuropeScope', 'AmericasScope')
+        pol = @((DPol 'GeoEurope' 'contoso.com' 'Allow' $true 1 'ClientSubnet EQ,EuropeSubnet' 'EuropeScope'), (DPol 'GeoAmericas' 'contoso.com' 'Allow' $true 2 'ClientSubnet EQ,AmericasSubnet' 'AmericasScope'),
+                (DPol 'MaintenanceWindow' 'contoso.com' 'Allow' $false 3 'TimeOfDay EQ,22:00-23:59' 'EuropeScope'))
+        dnssec = [pscustomobject]@{
+            keys = @([pscustomobject]@{ id = '3f8e9a12-7c41-4d2b-9e55-1a2b3c4d5e6f'; type = 'KeySigningKey'; algo = 'RsaSha256'; len = '2048'; state = 'Active'; next = 'None'; when = ''; period = '' },
+                     [pscustomobject]@{ id = '9b7c6d5e-4f3a-4b2c-8d1e-0f9e8d7c6b5a'; type = 'ZoneSigningKey'; algo = 'RsaSha256'; len = '1024'; state = 'Active'; next = 'Rollover'; when = (Ts 12); period = '90 d' })
+            settings = [pscustomobject]([ordered]@{ DenialOfExistence = 'NSec3'; NSec3HashAlgorithm = 'RsaSha1'; NSec3Iterations = '50'; NSec3OptOut = 'False'; DistributeTrustAnchor = 'None'
+                EnableRfc5011KeyRollover = 'False'; DSRecordGenerationAlgorithm = 'Sha256'; DSRecordSetTtl = '1 h'; DnsKeyRecordSetTtl = '1 h'; SignatureInceptionOffset = '1 h' }) }
         ns = @((NsR 'ns1.contoso.com' '203.0.113.2' $true 18 2026101501 ''), (NsR 'ns2.contoso.com' '198.51.100.2' $true 41 2026100902 '')) }
 
     # 5 - legacy.local: nonsecure updates, no aging, plenty of stale records
@@ -576,7 +699,7 @@ function New-DemoData {
         'DynamicUpdate.DynamicUpdateReceived' = 391223; 'DynamicUpdate.DynamicUpdateRejected' = 1873; 'DynamicUpdate.DynamicUpdateWriteToDB' = 389350
         'ZoneTransfer.TransferRequestReceived' = 418; 'ZoneTransfer.TransferFailures' = 0 }
 
-    [pscustomobject]@{
+    $d = [pscustomobject]@{
         server = "DC01.$dom"; generated = $now.ToString('yyyy-MM-dd HH:mm'); scanned = $true; demo = $true; extName = 'www.microsoft.com'
         settings = [pscustomobject]@{ service = 'Running'; startType = 'Automatic'; version = '10.0.20348'; rodc = $false
             listen = @(); allIps = @('10.10.0.10'); roundRobin = $true; dnssec = $true; plugin = ''; bindSec = $false
@@ -594,8 +717,40 @@ function New-DemoData {
             [pscustomobject]@{ ip = '192.0.2.53'; ok = $false; dead = $true; ms = 2003; res = ''; err = 'This operation returned because the timeout period expired'; serial = $null })
         stats = [pscustomobject]@{ start = $now.AddDays(-23).ToString('yyyy-MM-dd HH:mm'); c = [pscustomobject]$c }
         zones = @($z1, $z2, $z3, $z4, $z5, $z6, $z7, $z8) + @($autos)
-        logs = $logs
+        logs = $logs; light = $false; cfg = $null
+        partitions = @([pscustomobject]@{ name = "DomainDnsZones.$dom"; flags = 'Enlisted Auto Domain'; state = '0'; zones = 4; replicas = 2 },
+                       [pscustomobject]@{ name = "ForestDnsZones.$dom"; flags = 'Enlisted Auto Forest'; state = '0'; zones = 2; replicas = 2 },
+                       [pscustomobject]@{ name = "DnsZones.legacy.$dom"; flags = 'Custom'; state = '0'; zones = 1; replicas = 1 })
+        policies = @((DPol 'BlockMalwareDomains' '' 'Deny' $true 1 'FQDN EQ,*.malware.example' ''))
+        subnets = @([pscustomobject]@{ name = 'EuropeSubnet'; v4 = '10.10.0.0/16'; v6 = '' }, [pscustomobject]@{ name = 'AmericasSubnet'; v4 = '10.20.0.0/16'; v6 = '' })
+        recScopes = @([pscustomobject]@{ name = '.'; recursion = $true; fwd = '1.1.1.1, 9.9.9.9, 192.0.2.53' }, [pscustomobject]@{ name = 'NoRecursion'; recursion = $false; fwd = '' })
+        rrlEx = @(); trustPoints = @([pscustomobject]@{ name = 'contoso.com'; state = 'Valid'; last = (Ts 1); next = (Ts -1) })
     }
+    $d.cfg = [pscustomobject]([ordered]@{
+        'Server' = [pscustomobject]([ordered]@{ MajorVersion = '10'; MinorVersion = '0'; BuildNumber = '20348'; IsReadOnlyDC = 'False'; EnableDnsSec = 'True'; EnableIPv6 = 'True'; RoundRobin = 'True'; LocalNetPriority = 'True'
+            BindSecondaries = 'False'; StrictFileParsing = 'False'; NameCheckFlag = 'UTF8'; AutoConfigFileZones = 'Dynamic'; EnableDuplicateQuerySuppression = 'True'; MaximumUdpPacketSize = '4000'; ServerLevelPluginDll = ''; XfrConnectTimeout = '30 s' })
+        'Recursion' = [pscustomobject]([ordered]@{ Enable = 'True'; AdditionalTimeout = '4 s'; RetryInterval = '3 s'; Timeout = '8 s'; SecureResponse = 'True' })
+        'Forwarders' = [pscustomobject]([ordered]@{ IPAddress = '1.1.1.1, 9.9.9.9, 192.0.2.53'; UseRootHint = 'True'; Timeout = '3 s'; EnableReordering = 'True' })
+        'Cache' = [pscustomobject]([ordered]@{ MaxTTL = '1 d'; MaxNegativeTTL = '15 min'; MaxKBSize = '0'; EnablePollutionProtection = 'True'; LockingPercent = '100'; StoreEmptyAuthenticationResponse = 'True' })
+        'Scavenging' = [pscustomobject]([ordered]@{ ScavengingState = 'False'; ScavengingInterval = '7 d'; RefreshInterval = '7 d'; NoRefreshInterval = '7 d' })
+        'Global query block list' = [pscustomobject]([ordered]@{ Enable = 'True'; List = 'wpad, isatap' })
+        'EDNS' = [pscustomobject]([ordered]@{ CacheTimeout = '15 min'; EnableProbes = 'False'; EnableReception = 'True' })
+        'Active Directory' = [pscustomobject]([ordered]@{ DirectoryPartitionAutoEnlistInterval = '1 d'; LazyUpdateInterval = '3 s'; MinimumBackgroundLoadThreads = '1'; RemoteReplicationDelay = '30 s'; TombstoneInterval = '14 d' })
+    })
+    if ($Variant -eq 'target') {
+        # The new server: some settings changed, two static records and a conditional forwarder forgotten, a zone added...
+        $d.server = "DNS-NEW01.$dom"; $d.settings.version = '10.0.26100'; $d.settings.allIps = @('10.10.0.60'); $d.settings.scavOn = $true; $d.settings.lastScav = (Ts 2)
+        $d.settings.fwdIps = @('1.1.1.1', '8.8.8.8'); $d.settings.roundRobin = $false
+        $d.cfg.Server.BuildNumber = '26100'; $d.cfg.Server.RoundRobin = 'False'; $d.cfg.Forwarders.IPAddress = '1.1.1.1, 8.8.8.8'; $d.cfg.Scavenging.ScavengingState = 'True'
+        $z = $d.zones[0]
+        $z.records = @($z.records | Where-Object { $_.n -notin 'srv-backup01', 'esx03' -and -not ($_.ts -and ($now - [datetime]$_.ts).TotalDays -gt 14) } | ForEach-Object {
+            if ($_.n -eq 'intranet') { Rr 'intranet' 'CNAME' "srv-web02.$dom." 3600 '' } elseif ($_.n -eq 'srv-sql01') { Rr 'srv-sql01' 'A' $_.d 600 '' } else { $_ } })
+        $z.total = $z.records.Count
+        $d.zones[3].xfer = 'TransferToZoneNameServer'
+        $d.zones = @($d.zones | Where-Object { $_.name -ne 'northwind.lab' }) + @(Zone @{ name = "newapp.$dom"; records = @((Rr '@' 'SOA' "dns-new01.$dom. hostmaster.$dom. 1" 3600 ''), (Rr '@' 'NS' "dns-new01.$dom." 3600 ''), (Rr 'api' 'A' '10.10.40.10' 3600 '')) })
+        $d.policies = @(); $d.partitions = @($d.partitions | Select-Object -First 2)
+    }
+    $d
 }
 
 # =============================================================================
@@ -705,7 +860,7 @@ const ipN=ip=>/^\d+\.\d+\.\d+\.\d+$/.test(String(ip))?String(ip).split('.').redu
 const kv=(k,v)=>`<div><span>${k}</span><b>${v}</b></div>`;
 const badge=(n,c)=>`<span class="badge ${c||''}">${n}</span>`;
 const SEV={crit:0,warn:1,info:2}, SEVL={crit:'Critical',warn:'Warning',info:'Info'};
-const plural=(n,w)=>`${fmt(n)} ${w}${n===1?'':/(s|x|ch|sh)$/.test(w)?'es':'s'}`;
+const plural=(n,w)=>n===1?`${fmt(n)} ${w}`:/[^aeiou]y$/.test(w)?`${fmt(n)} ${w.slice(0,-1)}ies`:`${fmt(n)} ${w}${/(s|x|ch|sh)$/.test(w)?'es':'s'}`;
 const fmt=n=>Number(n||0).toLocaleString('en-US');
 const z0=n=>n?fmt(n):'<span class="mut">0</span>';
 const wday=d=>{const x=new Date(d+'T00:00:00');return isNaN(x)?'':x.toLocaleDateString('en-US',{weekday:'short'})};
@@ -717,17 +872,57 @@ const ago=a=>a==null?'':a<1?'today':Math.round(a)+' d ago';
 const ttlF=s=>{s=+s||0;return s>=86400&&s%3600===0?(s/86400).toFixed(s%86400?1:0)+' d':s>=3600?(s/3600).toFixed(s%3600?1:0)+' h':s>=60?Math.round(s/60)+' min':s+' s'};
 const yn=(v,y,n)=>v==null?'n/a':(v?y:n);
 const pct=(a,b)=>b?Math.round(a*1000/b)/10:0;
+/* values shown without esc() are forced to numbers: the report never trusts the shape of the data */
+const N=v=>{const n=Number(v);return isFinite(n)?n:0},Nn=v=>v==null||v===''?null:N(v);
+const obj=v=>v&&typeof v==='object'&&!Array.isArray(v)?v:{};
+const DYN={Secure:['Secure only','ok'],NonsecureAndSecure:['Nonsecure + secure','crit'],None:['None','']};
+const dynP=d=>{const x=DYN[d]||[d||'n/a',''];return `<span class="pill ${x[1]}">${esc(x[0])}</span>`};
+const XFR={NoTransfer:'Not allowed',TransferToZoneNameServer:'Only to NS servers',TransferToSecureServers:'Only to listed servers',TransferAnyServer:'<span class="tcrit">To any server</span>'};
+const store=z=>z.ad?`AD &middot; ${esc(z.repl)}`:z.file?'File &middot; '+esc(z.file):'&ndash;';
+const recState=r=>r.ts?(r.stale?'<span class="pill warn">Stale</span>':'<span class="pill ok">Dynamic</span>'):'<span class="pill">Static</span>';
 
+/* ---------- components (shared by the analysis and the comparison) ---------- */
+function sec(id,title,b,body,open){return `<section class="sec${open?' open':''}" id="${id}"><h2>${title} ${b||''}</h2><div class="body">${body}</div></section>`}
+function chips(id,items){return `<div class="chips" data-for="${id}">${items.map((it,i)=>`<button data-f="${it[0]}" class="${i?'':'on'}">${it[1]} ${badge(it[2])}</button>`).join('')}</div>`}
+function makeGrid(host,cols,rows,o={}){
+  const search=o.search!==false,MAX=o.max||1000;let sk=null,sd=1,q=o.q||'';
+  host.innerHTML=(search?'<input class="flt" type="search" placeholder="Filter...">':'')+'<div class="tw g"><table><thead></thead><tbody></tbody></table></div><div class="mut hint"></div>';
+  const th=host.querySelector('thead'),tb=host.querySelector('tbody'),cnt=host.querySelector('.hint');
+  if(search)host.querySelector('.flt').value=q;
+  const val=(r,c)=>c.sv?c.sv(r):String(r[c.k]??'').toLowerCase();
+  function draw(){
+    th.innerHTML='<tr>'+cols.map((c,i)=>`<th data-i="${i}" class="${c.num?'num':''}">${c.t}${sk===i?(sd>0?' &#9650;':' &#9660;'):''}</th>`).join('')+'</tr>';
+    let R=rows;if(q){const Q=q.toLowerCase();R=R.filter(r=>cols.some(c=>String(r[c.k]??'').toLowerCase().includes(Q)))}
+    if(sk!==null){const c=cols[sk];R=[...R].sort((a,b)=>{const x=val(a,c),y=val(b,c);return(x>y?1:x<y?-1:0)*sd})}
+    tb.innerHTML=R.length?R.slice(0,MAX).map(r=>'<tr>'+cols.map(c=>`<td class="${c.num?'num':''}${c.brk?' brk':''}">${c.f?c.f(r):esc(r[c.k])}</td>`).join('')+'</tr>').join(''):`<tr><td colspan="${cols.length}" class="mut">${o.empty||'No data'}</td></tr>`;
+    cnt.textContent=(R.length===rows.length?plural(rows.length,'item'):`${fmt(R.length)} of ${plural(rows.length,'item')}`)+(R.length>MAX?` (showing the first ${fmt(MAX)}: use the filter to narrow down)`:'');
+  }
+  th.onclick=e=>{const t=e.target.closest('th');if(!t)return;const i=+t.dataset.i;if(sk===i)sd=-sd;else{sk=i;sd=1}draw()};
+  if(search)host.querySelector('.flt').oninput=e=>{q=e.target.value;draw()};
+  draw();
+  return {setQ:v=>{q=v;if(search)host.querySelector('.flt').value=v;draw()},setRows:r=>{rows=r;draw()}};
+}
+
+/* ======================================================================== */
+/*  ANALYSIS DASHBOARD                                                      */
+/* ======================================================================== */
+function runAnalyze(){
 /* ---------- data normalization ---------- */
 D.zones=arr(D.zones);D.tests=arr(D.tests);D.forwarders=arr(D.forwarders);D.rootHints=arr(D.rootHints);
 const S=D.settings||{};['fwdIps','listen','allIps'].forEach(k=>S[k]=arr(S[k]));
 const LG=D.logs||null;if(LG){['events','days','rows'].forEach(k=>LG[k]=arr(LG[k]))}
-/* values shown without esc() are forced to numbers here: the report never trusts the shape of the data */
-const N=v=>{const n=Number(v);return isFinite(n)?n:0},Nn=v=>v==null||v===''?null:N(v);
 ['recTimeout','fwdTimeout','rootN','scavIntH','cacheMaxKB','locking'].forEach(k=>S[k]=Nn(S[k]));
 [...D.tests,...D.forwarders].forEach(t=>{t.ms=N(t.ms);t.serial=Nn(t.serial)});
 if(LG){LG.events.forEach(e=>{e.id=N(e.id);e.level=N(e.level);e.count=N(e.count)});LG.rows.forEach(r=>r.id=N(r.id));LG.days.forEach(d=>Object.keys(d).forEach(k=>{if(k!=='day')d[k]=N(d[k])}))}
 const ST=D.stats&&D.stats.c?D.stats:null;
+['partitions','policies','subnets','recScopes','rrlEx','trustPoints'].forEach(k=>D[k]=arr(D[k]));D.cfg=obj(D.cfg);
+D.policies.forEach(p=>p.order=N(p.order));D.partitions.forEach(p=>{p.zones=N(p.zones);p.replicas=N(p.replicas)});
+D.zones.forEach(z=>{z.deleg=arr(z.deleg);z.deleg.forEach(d=>{d.ns=arr(d.ns);d.ns.forEach(x=>x.ms=N(x.ms))});z.scopes=arr(z.scopes);z.pol=arr(z.pol);z.pol.forEach(p=>p.order=N(p.order));
+  if(z.dnssec){z.dnssec.keys=arr(z.dnssec.keys);z.dnssec.settings=obj(z.dnssec.settings)}});
+const ALLPOL=[...D.policies,...D.zones.flatMap(z=>z.pol)];
+const POLCOLS=[{k:'order',t:'Order',num:1,sv:r=>r.order},{k:'name',t:'Policy'},{k:'kind',t:'Kind'},{k:'zone',t:'Zone',f:r=>r.zone?esc(r.zone):'<span class="mut">server</span>'},{k:'enabled',t:'Enabled',sv:r=>r.enabled?1:0,f:r=>r.enabled?'<span class="pill ok">Yes</span>':'<span class="pill warn">No</span>'},
+  {k:'action',t:'Action'},{k:'criteria',t:'Criteria',brk:1,f:r=>esc(r.criteria)+(r.cond?' <span class="mut">('+esc(r.cond)+')</span>':'')},{k:'content',t:'Scopes',brk:1}];
+const cfgRows=Object.keys(D.cfg).flatMap(g=>Object.keys(obj(D.cfg[g])).map(k=>({g,k,v:String(D.cfg[g][k]??'')})));
 D.zones.forEach(z=>{
   ['records','ns','masters','xferTo','fwdTest'].forEach(k=>z[k]=arr(z[k]));
   if(z.scan){z.scan.ips=arr(z.scan.ips);z.scan.total=N(z.scan.total);z.scan.ips.forEach(x=>x.cls=x.cls==='live'?'live':'dead')}
@@ -843,6 +1038,19 @@ D.zones.forEach(z=>{
   if(z.scan){const d=z.scan.ips.filter(x=>x.cls==='dead');if(d.length)add('info',`${L}: ${plural(d.length,'static or stale address')} with no evidence of a live host (cleanup candidates)`,id,null,'live')}
   if(z.truncated)add('info',`${L} has ${fmt(z.total)} records: only the first ${fmt(z.records.length)} are in the report`,id);
 });
+D.zones.forEach(z=>{
+  if(z.auto)return;const L=zL(z),id=z.name;
+  z.deleg.forEach(d=>{const t=d.ns.filter(x=>x.tested),b=t.filter(x=>!x.ok);
+    if(t.length&&b.length===t.length)add('warn',`${L}: delegation <b>${esc(d.name)}</b> is lame, none of its name servers answers (${b.map(x=>esc(x.name)).join(', ')})`,id,null,'deleg');
+    else if(b.length)add('warn',`${L}: delegation <b>${esc(d.name)}</b>, ${b.map(x=>esc(x.name)).join(', ')} not answering`,id,null,'deleg')});
+  if(z.dnssec){const k=z.dnssec.keys,has=t=>k.some(x=>(t==='KSK'?/KSK|KEYSIGNING/:/ZSK|ZONESIGNING/).test(String(x.type).toUpperCase()));
+    if(!k.length)add('warn',`${L} is signed but no signing keys could be read`,id,null,'sec');
+    else{if(!has('KSK'))add('warn',`${L} is signed without a key signing key (KSK)`,id,null,'sec');if(!has('ZSK'))add('warn',`${L} is signed without a zone signing key (ZSK)`,id,null,'sec');
+      const late=k.filter(x=>x.when&&dAge(x.when)>1);if(late.length)add('warn',`${L}: ${plural(late.length,'DNSSEC key')} past the planned rollover time (${late.map(x=>esc(x.type)+' '+esc(x.when)).join(', ')})`,id,null,'sec')}}
+});
+D.partitions.forEach(p=>{if(/dnszones/i.test(p.name)&&!/enlist/i.test(p.flags))add('warn',`Directory partition <b>${esc(p.name)}</b>: this DNS server is not enlisted, so the AD-integrated zones stored there are not loaded here`,null,'adv')});
+if(ALLPOL.length){const off=ALLPOL.filter(p=>!p.enabled).length;
+  add('info',`${plural(ALLPOL.length,'DNS policy')} configured: answers can change with the client subnet, time of day or server interface${off?' &middot; '+off+' disabled':''}`,null,'adv')}
 const noRev=new Set();
 if(REV.length)HZ.filter(z=>!z.rev).forEach(z=>z.records.forEach(r=>{if(r.t==='A'&&!special(r)&&/^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(r.d)&&!revOf(r.d))noRev.add(r.d.split('.').slice(0,3).join('.')+'.x')}));
 if(noRev.size)add('info',`A records in ${plural(noRev.size,'private /24 subnet')} have no reverse lookup zone on this server: ${esc([...noRev].slice(0,6).join(', '))}${noRev.size>6?'...':''}`,null,'zones');
@@ -862,32 +1070,7 @@ D.zones.forEach(z=>{const m=I.filter(i=>i.zone===z.name).sort((a,b)=>SEV[a.sev]-
 const logProb=evErr+lt.warn;
 const nC=I.filter(i=>i.sev==='crit').length,nW=I.filter(i=>i.sev==='warn').length,nI=I.filter(i=>i.sev==='info').length;
 
-/* ---------- components ---------- */
-function sec(id,title,b,body,open){return `<section class="sec${open?' open':''}" id="${id}"><h2>${title} ${b||''}</h2><div class="body">${body}</div></section>`}
-function chips(id,items){return `<div class="chips" data-for="${id}">${items.map((it,i)=>`<button data-f="${it[0]}" class="${i?'':'on'}">${it[1]} ${badge(it[2])}</button>`).join('')}</div>`}
-function makeGrid(host,cols,rows,o={}){
-  const search=o.search!==false,MAX=o.max||1000;let sk=null,sd=1,q=o.q||'';
-  host.innerHTML=(search?'<input class="flt" type="search" placeholder="Filter...">':'')+'<div class="tw g"><table><thead></thead><tbody></tbody></table></div><div class="mut hint"></div>';
-  const th=host.querySelector('thead'),tb=host.querySelector('tbody'),cnt=host.querySelector('.hint');
-  if(search)host.querySelector('.flt').value=q;
-  const val=(r,c)=>c.sv?c.sv(r):String(r[c.k]??'').toLowerCase();
-  function draw(){
-    th.innerHTML='<tr>'+cols.map((c,i)=>`<th data-i="${i}" class="${c.num?'num':''}">${c.t}${sk===i?(sd>0?' &#9650;':' &#9660;'):''}</th>`).join('')+'</tr>';
-    let R=rows;if(q){const Q=q.toLowerCase();R=R.filter(r=>cols.some(c=>String(r[c.k]??'').toLowerCase().includes(Q)))}
-    if(sk!==null){const c=cols[sk];R=[...R].sort((a,b)=>{const x=val(a,c),y=val(b,c);return(x>y?1:x<y?-1:0)*sd})}
-    tb.innerHTML=R.length?R.slice(0,MAX).map(r=>'<tr>'+cols.map(c=>`<td class="${c.num?'num':''}${c.brk?' brk':''}">${c.f?c.f(r):esc(r[c.k])}</td>`).join('')+'</tr>').join(''):`<tr><td colspan="${cols.length}" class="mut">${o.empty||'No data'}</td></tr>`;
-    cnt.textContent=(R.length===rows.length?plural(rows.length,'item'):`${fmt(R.length)} of ${plural(rows.length,'item')}`)+(R.length>MAX?` (showing the first ${fmt(MAX)}: use the filter to narrow down)`:'');
-  }
-  th.onclick=e=>{const t=e.target.closest('th');if(!t)return;const i=+t.dataset.i;if(sk===i)sd=-sd;else{sk=i;sd=1}draw()};
-  if(search)host.querySelector('.flt').oninput=e=>{q=e.target.value;draw()};
-  draw();
-}
 const res=t=>t.ok?'<span class="pill ok">OK</span>':t.dead?'<span class="pill crit">No answer</span>':'<span class="pill warn">Error</span>';
-const DYN={Secure:['Secure only','ok'],NonsecureAndSecure:['Nonsecure + secure','crit'],None:['None','']};
-const dynP=d=>{const x=DYN[d]||[d||'n/a',''];return `<span class="pill ${x[1]}">${esc(x[0])}</span>`};
-const XFR={NoTransfer:'Not allowed',TransferToZoneNameServer:'Only to NS servers',TransferToSecureServers:'Only to listed servers',TransferAnyServer:'<span class="tcrit">To any server</span>'};
-const store=z=>z.ad?`AD &middot; ${esc(z.repl)}`:z.file?'File &middot; '+esc(z.file):'&ndash;';
-const recState=r=>r.ts?(r.stale?'<span class="pill warn">Stale</span>':'<span class="pill ok">Dynamic</span>'):'<span class="pill">Static</span>';
 
 /* ---------- zones ---------- */
 const ZF={all:z=>!z.auto,att:z=>z.sev==='crit'||z.sev==='warn',fwd:z=>!z.auto&&!z.rev&&z.type!=='Forwarder'&&z.type!=='Stub',rev:z=>!z.auto&&z.rev,cf:z=>z.type==='Forwarder'||z.type==='Stub',auto:z=>z.auto};
@@ -921,6 +1104,9 @@ function buildDetail(el,z,tab,q){
   if(!fw)T.push(['rec',`Records (${fmt(z.records.length)})`],['prob',`Problems (${fmt(z.p.length)})`]);
   T.push(['ns',fw?'Forwarder servers':`Name servers (${z.ns.length})`]);
   if(z.scan)T.push(['live',`Liveness (${z.scan.ips.length})`]);
+  if(z.deleg.length)T.push(['deleg',`Delegations (${z.deleg.length})`]);
+  if(z.dnssec)T.push(['sec','DNSSEC']);
+  if(z.pol.length||z.scopes.length)T.push(['pol',`Policies (${z.pol.length})`]);
   el.innerHTML=`<div class="tabs">${T.map(t=>`<button data-tab="${t[0]}">${t[1]}</button>`).join('')}</div><div class="tab"></div>`;
   el.querySelector('.tabs').onclick=e=>{const b=e.target.closest('button');if(b){e.stopPropagation();showTab(el,z,b.dataset.tab)}};
   showTab(el,z,tab,q);
@@ -975,6 +1161,19 @@ function showTab(el,z,t,q){
       <h3>No response: cleanup candidates</h3><div class="gg"></div>
       <div class="mut hint">No response = no evidence of a live host at the time of the test, not a guarantee: the device may be off or firewalled. Verify before deleting records.</div>`;
     makeGrid(T.querySelector('.gg'),[{k:'ip',t:'IP',sv:r=>ipN(r.ip)},{k:'names',t:'Names',brk:1},{k:'kind',t:'Kind',f:r=>r.kind==='static'?'<span class="pill">Static</span>':'<span class="pill warn">Stale</span>'}],sc.ips.filter(x=>x.cls==='dead'),{empty:'Every checked address responds'});
+  }else if(t==='deleg'){
+    const glue=n=>{const l=lc(n);return l===z.fq||l.endsWith('.'+z.fq)?z.records.filter(r=>r.fq===l&&(r.t==='A'||r.t==='AAAA')).map(r=>r.d).join(', ')||'<span class="twarn">missing</span>':'<span class="mut">not needed</span>'};
+    T.innerHTML=`<div class="wrap"><table><thead><tr><th>Delegated zone</th><th>Name server</th><th>Glue (A/AAAA here)</th><th>Result</th><th class="num">Time</th><th>Error</th></tr></thead><tbody>${z.deleg.map(d=>d.ns.map((x,i)=>`<tr><td>${i?'':'<b>'+esc(d.name)+'</b>'}</td><td>${esc(x.name)}</td><td>${glue(x.name)}</td>
+      <td>${x.tested?res(x):'<span class="mut">not tested</span>'}</td><td class="num">${x.tested&&x.ip?x.ms+' ms':''}</td><td class="mut">${esc(x.err)}</td></tr>`).join('')).join('')}</tbody></table></div>
+      <div class="mut hint">A delegation hands a subdomain to other name servers. Each one is asked for the subdomain's SOA without recursion; a name server inside the delegated zone needs a glue record here.</div>`;
+  }else if(t==='sec'){
+    const s=z.dnssec;
+    T.innerHTML=`<h3>Signing keys</h3>${s.keys.length?`<div class="wrap"><table><thead><tr><th>Type</th><th>Algorithm</th><th class="num">Length</th><th>State</th><th>Next rollover</th><th>Rollover period</th><th>Key ID</th></tr></thead><tbody>${s.keys.map(k=>`<tr><td><b>${esc(k.type)}</b></td><td>${esc(k.algo)}</td><td class="num">${esc(k.len)}</td><td>${esc(k.state)}</td>
+      <td>${esc(k.next)}${k.when?' &middot; '+esc(k.when)+(dAge(k.when)>1?' <span class="twarn">(overdue)</span>':''):''}</td><td>${esc(k.period)}</td><td class="mut brk">${esc(k.id)}</td></tr>`).join('')}</tbody></table></div>`:'<div class="mut">No signing keys could be read.</div>'}
+      <h3>Zone signing settings</h3>${Object.keys(s.settings).length?`<div class="kv">${Object.keys(s.settings).map(k=>kv(esc(k),esc(s.settings[k])||'<span class="mut">&ndash;</span>')).join('')}</div>`:'<div class="mut">Not available.</div>'}`;
+  }else if(t==='pol'){
+    T.innerHTML=(z.scopes.length?`<h3>Zone scopes</h3><div class="kv">${z.scopes.map(s=>kv('Scope',esc(s))).join('')}</div>`:'')+'<h3>Zone policies</h3><div class="gg"></div>';
+    makeGrid(T.querySelector('.gg'),POLCOLS,z.pol,{empty:'No zone-level policies'});
   }
 }
 function openZone(id,tab,q){
@@ -1088,6 +1287,22 @@ function statsBody(){
 }
 h+=sec('stats','Statistics',ST&&ST.start?`<span class="mut">since ${esc(ST.start)}</span>`:'',statsBody(),false);
 
+function advBody(){
+  const tbl=(cols,rows)=>`<div class="wrap"><table><thead><tr>${cols.map(c=>`<th>${c}</th>`).join('')}</tr></thead><tbody>${rows.join('')}</tbody></table></div>`;
+  const none=t=>`<div class="mut">${t}</div>`;
+  const zs=D.zones.filter(z=>z.scopes.length);
+  return `<h3>Active Directory partitions</h3>${D.partitions.length?tbl(['Partition','Flags','State','Zones','Replicas'],D.partitions.map(p=>`<tr><td><b>${esc(p.name)}</b></td><td>${/dnszones/i.test(p.name)&&!/enlist/i.test(p.flags)?'<span class="twarn">'+esc(p.flags||'not enlisted')+'</span>':esc(p.flags)}</td><td>${esc(p.state)}</td><td class="num">${fmt(p.zones)}</td><td class="num">${fmt(p.replicas)}</td></tr>`)):none('No directory partitions: the server is not a domain controller, or they could not be read.')}
+    <h3>DNS policies (server and zones)</h3><div id="polg"></div>
+    <h3>Client subnets</h3>${D.subnets.length?tbl(['Name','IPv4 subnets','IPv6 subnets'],D.subnets.map(s=>`<tr><td><b>${esc(s.name)}</b></td><td>${esc(s.v4)}</td><td>${esc(s.v6)}</td></tr>`)):none('No client subnets.')}
+    <h3>Recursion scopes</h3>${D.recScopes.length?tbl(['Scope','Recursion','Forwarders'],D.recScopes.map(s=>`<tr><td><b>${esc(s.name)}</b></td><td>${s.recursion?'Enabled':'Disabled'}</td><td>${esc(s.fwd)||'<span class="mut">&ndash;</span>'}</td></tr>`)):none('No recursion scopes.')}
+    <h3>Zone scopes</h3>${zs.length?tbl(['Zone','Scopes'],zs.map(z=>`<tr><td><a data-zone="${esc(z.name)}" data-tab="pol">${esc(z.name)}</a></td><td>${esc(z.scopes.join(', '))}</td></tr>`)):none('No zone scopes.')}
+    <h3>Response rate limiting exceptions</h3>${D.rrlEx.length?tbl(['Name','FQDN','Client subnet','Condition'],D.rrlEx.map(x=>`<tr><td><b>${esc(x.name)}</b></td><td>${esc(x.fqdn)}</td><td>${esc(x.subnet)}</td><td>${esc(x.cond)}</td></tr>`)):none('No exceptions.')}
+    <h3>DNSSEC trust points</h3>${D.trustPoints.length?tbl(['Trust point','State','Last refresh','Next refresh'],D.trustPoints.map(x=>`<tr><td><b>${esc(x.name)}</b></td><td>${esc(x.state)}</td><td>${esc(x.last)}</td><td>${esc(x.next)}</td></tr>`)):none('No trust points.')}
+    <div class="mut hint">Policies, scopes and client subnets exist on Windows Server 2016 and later.</div>`;
+}
+const advN=D.partitions.length+ALLPOL.length+D.subnets.length+D.recScopes.length+D.trustPoints.length;
+h+=sec('adv','Policies, partitions and DNSSEC',badge(advN),advBody(),I.some(i=>i.go==='adv'&&i.sev!=='info'));
+
 h+=sec('config','Server configuration','',
   `<div class="kv">${kv('DNS Server service',S.service?(S.service==='Running'?'Running':'<span class="tcrit">'+esc(S.service)+'</span>')+(S.startType?' &middot; '+esc(S.startType):''):'n/a')}
   ${kv('DNS server version',S.version?esc(S.version):'n/a')}${kv('Read-only domain controller',yn(S.rodc,'Yes','No'))}
@@ -1100,7 +1315,8 @@ h+=sec('config','Server configuration','',
   ${kv('Global query block list',S.gqblOn==null?'n/a':S.gqblOn?'Enabled'+(S.gqbl?' &middot; '+esc(S.gqbl):''):'Disabled')}
   ${kv('Response rate limiting',esc(S.rrl)||'n/a')}${kv('Round robin',yn(S.roundRobin,'Enabled','Disabled'))}${kv('DNSSEC validation',yn(S.dnssec,'Enabled','Disabled'))}
   ${kv('Debug logging',S.debugLog==null?'n/a':S.debugLog?'<span class="twarn">Enabled</span>'+(S.debugPath?' &middot; '+esc(S.debugPath):''):'Disabled')}
-  ${kv('Server-level plugin DLL',S.plugin?'<span class="tcrit">'+esc(S.plugin)+'</span>':'None')}</div>`,false);
+  ${kv('Server-level plugin DLL',S.plugin?'<span class="tcrit">'+esc(S.plugin)+'</span>':'None')}</div>
+  <h3>All settings</h3><div id="cfgg"></div>`,false);
 
 $('#m').innerHTML=h;
 renderIssues('all');renderZones('all');
@@ -1108,6 +1324,8 @@ if(LG&&$('#lgr'))makeGrid($('#lgr'),[{k:'time',t:'Time'},{k:'id',t:'Event',sv:r=
   {k:'zone',t:'Zone',f:r=>r.zone&&D.zones.some(z=>z.name===r.zone)?`<a data-zone="${esc(r.zone)}">${esc(r.zone)}</a>`:esc(r.zone)},{k:'user',t:'User'},{k:'msg',t:'Details'}],LG.rows,{empty:LG.auditErr?'Audit log not available':'No manual changes in the last 7 days'});
 if(LG&&$('#lge'))makeGrid($('#lge'),[{k:'level',t:'Level',sv:r=>r.level,f:r=>{const l=LVL[r.level]||['Info','mut'];return `<span class="pill ${l[1]}">${l[0]}</span>`}},{k:'id',t:'Event ID',sv:r=>r.id,num:1},
   {k:'count',t:'Count',sv:r=>r.count,num:1},{k:'first',t:'First'},{k:'last',t:'Last'},{k:'msg',t:'Message',f:r=>esc(r.msg)+(EVH[r.id]?`<div class="mut" style="margin-top:4px">&#9432; ${EVH[r.id]}</div>`:'')}],LG.events,{empty:LG.eventsErr?'Event log not available':'No errors or warnings in the last 7 days'});
+makeGrid($('#polg'),POLCOLS,ALLPOL,{empty:'No DNS policies'});
+makeGrid($('#cfgg'),[{k:'g',t:'Group'},{k:'k',t:'Setting'},{k:'v',t:'Value',brk:1}],cfgRows,{empty:'Not available (report created by an older version, or the settings could not be read)'});
 if(ST&&$('#stg'))makeGrid($('#stg'),[{k:'g',t:'Group'},{k:'n',t:'Counter'},{k:'v',t:'Value',num:1,sv:r=>r.v,f:r=>fmt(r.v)}],Object.keys(ST.c).map(k=>({g:k.split('.').slice(0,-1).join('.'),n:k.split('.').pop(),v:+ST.c[k]})),{empty:'No counters'});
 
 /* ---------- interactions ---------- */
@@ -1122,7 +1340,177 @@ document.addEventListener('click',e=>{
 $('#bx').onclick=()=>document.querySelectorAll('.sec').forEach(s=>s.classList.add('open'));
 $('#bc').onclick=()=>document.querySelectorAll('.sec').forEach(s=>s.classList.remove('open'));
 let tmr;$('#q').oninput=e=>{clearTimeout(tmr);tmr=setTimeout(()=>search(e.target.value),250)};
+Object.assign(window,{openZone,search,renderZones});
+}
+/* ======================================================================== */
+/*  COMPARISON DASHBOARD (D.mode==='compare': D.a = source/old, D.b = target/new) */
+/* ======================================================================== */
+function runCompare(){
+const nz=x=>{x=obj(x);x.zones=arr(x.zones);x.settings=obj(x.settings);['fwdIps','listen','allIps'].forEach(k=>x.settings[k]=arr(x.settings[k]));
+  x.rootHints=arr(x.rootHints);x.cfg=obj(x.cfg);['partitions','policies','subnets','recScopes','rrlEx','trustPoints'].forEach(k=>x[k]=arr(x[k]));
+  x.policies.forEach(p=>p.order=N(p.order));
+  x.zones.forEach(z=>{['records','masters','xferTo','scopes','pol'].forEach(k=>z[k]=arr(z[k]));z.fq=lc(z.name);z.total=N(z.total);z.pol.forEach(p=>p.order=N(p.order));
+    if(z.soa)['serial','refresh','retry','expire','minTtl'].forEach(k=>z.soa[k]=N(z.soa[k]));
+    if(z.dnssec)z.dnssec.keys=arr(z.dnssec.keys);
+    z.records.forEach(r=>{r.n=String(r.n??'');r.t=String(r.t??'').toUpperCase();r.d=String(r.d??'');r.ttl=N(r.ttl);r.fq=r.n==='@'?z.fq:lc(r.n)+'.'+z.fq})});
+  return x};
+const A=nz(D.a),B=nz(D.b),AI=obj(D.aInfo),BI=obj(D.bInfo);
+/* a source created by 1.0.x has none of the data added in 1.1.0: those categories are skipped instead of showing false differences */
+const NEW=!D.aPartial;
+const OLDNOTE='The source was created by an older version of DNS Analyzer: all settings, AD partitions, DNS policies, client subnets, zone and recursion scopes, rate limiting exceptions, DNSSEC keys and trust points are not compared.';
+const nameA=AI.name||A.server||'source',nameB=BI.name||B.server||'target';
+const R=[],add=(sev,cat,o,item,a,b,zone)=>R.push({sev,cat,obj:String(o??''),item:String(item??''),a:String(a??''),b:String(b??''),zone:zone||''});
+const sv=v=>v==null?'':Array.isArray(v)?v.map(String).join(', '):typeof v==='boolean'?(v?'Yes':'No'):String(v);
+const sset=v=>arr(v).map(x=>lc(x)).filter(Boolean).sort().join(', ');
+const cmp=(sev,cat,o,item,a,b,zone)=>{if(sv(a)!==sv(b))add(sev,cat,o,item,sv(a),sv(b),zone)};
+const NOT='(not present)';
+const byName=(list,key)=>{const m=new Map();list.forEach(x=>m.set(lc(key(x)),x));return m};
+function sets(cat,o,label,la,lb,missSev,zone){const a=new Set(arr(la).map(lc).filter(Boolean)),b=new Set(arr(lb).map(lc).filter(Boolean));
+  a.forEach(x=>{if(!b.has(x))add(missSev,cat,o,label,x,NOT,zone)});b.forEach(x=>{if(!a.has(x))add('info',cat,o,label,NOT,x,zone)})}
+function named(cat,listA,listB,key,fields,missSev,zone,oname){const ma=byName(listA,key),mb=byName(listB,key);
+  ma.forEach((x,k)=>{const o=(oname||'')+key(x);const y=mb.get(k);if(!y){add(typeof missSev==='function'?missSev(x):missSev,cat,o,'Exists','yes',NOT,zone);return}
+    fields.forEach(f=>cmp(f[2]||'warn',cat,o,f[1],typeof f[0]==='function'?f[0](x):x[f[0]],typeof f[0]==='function'?f[0](y):y[f[0]],zone))});
+  mb.forEach((y,k)=>{if(!ma.has(k))add('info',cat,(oname||'')+key(y),'Exists',NOT,'yes',zone)})}
+
+/* ---------- server ---------- */
+const SA=A.settings,SB=B.settings;
+cmp('info','Server','Server','Name',A.server,B.server);
+const SF=[['version','DNS server version','info'],['service','DNS Server service','warn'],['rodc','Read-only domain controller','info'],['listen','Listening addresses','info'],['allIps','Server IP addresses','info'],
+  ['recursion','Recursion'],['recTimeout','Recursion timeout (s)'],['secureResp','Secure responses'],['useRoot','Use root hints if forwarders fail'],['fwdTimeout','Forwarder timeout (s)'],
+  ['scavOn','Scavenging'],['scavInt','Scavenging interval'],['scavNoRef','Default no-refresh interval'],['scavRef','Default refresh interval'],
+  ['cacheMaxKB','Cache size limit (KB)'],['cacheMaxTtl','Cache maximum TTL'],['pollution','Cache pollution protection'],['locking','Cache locking (%)'],
+  ['gqblOn','Global query block list'],['gqbl','Global query block list entries'],['rrl','Response rate limiting'],['roundRobin','Round robin'],['dnssec','DNSSEC validation'],
+  ['bindSec','Bind secondaries'],['debugLog','Debug logging','info'],['plugin','Server-level plugin DLL']];
+SF.forEach(f=>{if(f[0]==='gqbl')cmp('warn','Server','Server',f[1],sset(String(SA.gqbl||'').split(',')),sset(String(SB.gqbl||'').split(',')));else cmp(f[2]||'warn','Server','Server',f[1],SA[f[0]],SB[f[0]])});
+sets('Forwarders','Forwarders','Forwarder',SA.fwdIps,SB.fwdIps,'crit');
+if(sset(SA.fwdIps)===sset(SB.fwdIps)&&sv(SA.fwdIps)!==sv(SB.fwdIps))add('info','Forwarders','Forwarders','Order (queried in this order)',sv(SA.fwdIps),sv(SB.fwdIps));
+if(A.rootHints.length&&B.rootHints.length)sets('Root hints','Root hints','Root server',A.rootHints.map(r=>r.name),B.rootHints.map(r=>r.name),'warn');
+/* all settings, except the ones already compared above */
+const COVERED=/^(Server\.(RoundRobin|EnableDnsSec|BindSecondaries|MajorVersion|MinorVersion|BuildNumber|IsReadOnlyDC|ServerLevelPluginDll)|Recursion\.(Enable|Timeout|SecureResponse)|Forwarders\.(IPAddress|UseRootHint|Timeout)|Cache\.(MaxKBSize|MaxTTL|EnablePollutionProtection|LockingPercent)|Scavenging\.(ScavengingState|ScavengingInterval|RefreshInterval|NoRefreshInterval)|Global query block list\.(Enable|List)|Response rate limiting\.Mode)$/;
+const NOISE=/name|address|ip$|ips$|version|build|path|computer|time$|date|guid|id$/i;
+if(NEW)Object.keys(A.cfg).forEach(g=>{const ga=obj(A.cfg[g]),gb=B.cfg[g];if(!gb)return;
+  Object.keys(ga).forEach(k=>{if(COVERED.test(g+'.'+k)||!(k in obj(gb)))return;cmp(NOISE.test(k)?'info':'warn','All settings',g,k,ga[k],gb[k])})});
+
+/* ---------- zones and records ---------- */
+const ZA=byName(A.zones,z=>z.name),ZB=byName(B.zones,z=>z.name),ZR=[];
+const ZF=[['type','Type'],['ad','AD-integrated'],['repl','Replication scope'],['dyn','Dynamic updates'],['aging','Aging'],['noRef','No-refresh interval'],['refr','Refresh interval'],
+  ['xfer','Zone transfers'],[z=>sset(z.xferTo),'Zone transfer servers'],['notify','Notify'],[z=>sset(z.masters),'Master / forwarder servers'],['useRec','Use recursion (forwarder)'],
+  ['fwdTimeout','Forwarder timeout'],['signed','DNSSEC signed'],['paused','Paused'],['shutdown','Shut down'],['file','Zone file','info']];
+const POLF=[['kind','Kind'],['action','Action'],['enabled','Enabled'],['order','Processing order'],['criteria','Criteria'],['cond','Condition'],['content','Scopes']];
+const rk=r=>r.fq+'|'+r.t+'|'+lc(r.d);
+const MAXREC=3000;let recRows=0,recMore=0,statMiss=0;
+const recAdd=(...x)=>{if(recRows<MAXREC){recRows++;add(...x)}else recMore++};
+ZA.forEach((za,k)=>{const zb=ZB.get(k),o=za.name;
+  const row={name:za.name,a:za,b:zb||null};ZR.push(row);
+  if(!zb){add(za.auto?'info':'crit','Zones',o,'Zone',za.type,NOT,za.name);return}
+  ZF.forEach(f=>{const g=typeof f[0]==='function'?f[0]:z=>z[f[0]];cmp(f[2]||'warn','Zones',o,f[1],g(za),g(zb),za.name)});
+  if(za.soa&&zb.soa){[['refresh','SOA refresh'],['retry','SOA retry'],['expire','SOA expire'],['minTtl','SOA minimum (negative) TTL']].forEach(f=>cmp('warn','Zones',o,f[1],ttlF(za.soa[f[0]]),ttlF(zb.soa[f[0]]),za.name));
+    cmp('info','Zones',o,'SOA primary server',lc(za.soa.primary),lc(zb.soa.primary),za.name);cmp('info','Zones',o,'SOA responsible person',lc(za.soa.admin),lc(zb.soa.admin),za.name)}
+  if(NEW){sets('Policies',o,'Zone scope',za.scopes,zb.scopes,'crit',za.name);
+  named('Policies',za.pol,zb.pol,p=>p.name,POLF,'crit',za.name,o+' / policy ')}
+  if(NEW&&(za.dnssec||zb.dnssec)){const cnt=z=>z&&z.dnssec?z.dnssec.keys.map(x=>x.type).sort().join(', '):'';cmp('warn','DNSSEC',o,'Signing keys',cnt(za),cnt(zb),za.name)}
+  if(za.type==='Forwarder')return;
+  if(za.truncated||zb.truncated)add('info','Records',o,'Records compared',`first ${fmt(za.records.length)} of ${fmt(za.total)}`,`first ${fmt(zb.records.length)} of ${fmt(zb.total)}`,za.name);
+  const ka=new Map(),kb=new Map(),na=new Map(),nb=new Map();
+  za.records.forEach(r=>{if(r.t==='SOA')return;ka.set(rk(r),r);const n=r.fq+'|'+r.t;if(!na.has(n))na.set(n,[]);na.get(n).push(r)});
+  zb.records.forEach(r=>{if(r.t==='SOA')return;kb.set(rk(r),r);const n=r.fq+'|'+r.t;if(!nb.has(n))nb.set(n,[]);nb.get(n).push(r)});
+  let dynMiss=0,dynExtra=0;const done=new Set();
+  ka.forEach((r,key)=>{const y=kb.get(key);
+    if(y){if(r.ttl!==y.ttl&&!r.ts)recAdd('info','Records',o,`${r.fq} ${r.t} (TTL)`,ttlF(r.ttl),ttlF(y.ttl),za.name);return}
+    const n=r.fq+'|'+r.t;
+    if(r.ts){if(!nb.has(n))dynMiss++;return}
+    const other=(nb.get(n)||[]).filter(x=>!ka.has(rk(x)));
+    if(other.length&&!done.has(n)){done.add(n);const mine=na.get(n).filter(x=>!kb.has(rk(x))&&!x.ts);
+      recAdd(r.n==='@'&&r.t==='NS'?'info':'warn','Records',o,`${r.fq} ${r.t}`,mine.map(x=>x.d).join(', '),other.map(x=>x.d).join(', '),za.name);
+      other.forEach(x=>done.add(rk(x)));return}
+    if(done.has(n))return;
+    if(r.n==='@'&&r.t==='NS'){recAdd('info','Records',o,`${r.fq} NS`,r.d,NOT,za.name);return}
+    statMiss++;recAdd('crit','Records',o,`${r.fq} ${r.t}`,r.d,NOT,za.name)});
+  kb.forEach((r,key)=>{if(ka.has(key)||done.has(key))return;const n=r.fq+'|'+r.t;
+    if(r.ts){if(!na.has(n))dynExtra++;return}
+    if(done.has(n))return;
+    recAdd('info','Records',o,`${r.fq} ${r.t}`,NOT,r.d,za.name)});
+  if(dynMiss)add('info','Records',o,'Dynamic records only on the source',plural(dynMiss,'record'),'',za.name+'');
+  if(dynExtra)add('info','Records',o,'Dynamic records only on the target','',plural(dynExtra,'record'),za.name);
+});
+ZB.forEach((zb,k)=>{if(!ZA.has(k)){ZR.push({name:zb.name,a:null,b:zb});add('info','Zones',zb.name,'Zone',NOT,zb.type,zb.name)}});
+if(recMore)add('info','Records','All zones','Record differences not listed',`${fmt(recMore)} more`,'','');
+
+/* ---------- other objects ---------- */
+if(NEW){
+named('Partitions',A.partitions,B.partitions,p=>p.name,[['flags','Flags'],['state','State','info']],p=>/dnszones/i.test(p.name)?'crit':'warn');
+named('Policies',A.policies,B.policies,p=>p.name,POLF,'crit','','Server / policy ');
+named('Policies',A.subnets,B.subnets,s=>s.name,[['v4','IPv4 subnets'],['v6','IPv6 subnets']],'crit','','Client subnet ');
+named('Policies',A.recScopes,B.recScopes,s=>s.name,[['recursion','Recursion'],[s=>sset(String(s.fwd||'').split(',')),'Forwarders']],'crit','','Recursion scope ');
+named('Server',A.rrlEx,B.rrlEx,s=>s.name,[['fqdn','FQDN'],['subnet','Client subnet'],['cond','Condition']],'warn','','Rate limiting exception ');
+named('DNSSEC',A.trustPoints,B.trustPoints,s=>s.name,[['state','State','info']],'warn','','Trust point ');
+}
+
+/* ---------- summary ---------- */
+R.forEach(r=>{if(r.a==='yes'&&r.b===NOT){r.a='present';r.b='missing'}else if(r.a===NOT&&r.b==='yes'){r.a='missing';r.b='present'}});
+R.sort((x,y)=>SEV[x.sev]-SEV[y.sev]||x.cat.localeCompare(y.cat)||x.obj.localeCompare(y.obj));
+const nC=R.filter(r=>r.sev==='crit').length,nW=R.filter(r=>r.sev==='warn').length,nI=R.filter(r=>r.sev==='info').length;
+ZR.forEach(z=>{const rows=R.filter(r=>r.zone===z.name);z.c={crit:0,warn:0,info:0};rows.forEach(r=>z.c[r.sev]++);
+  z.st=!z.b?'only-a':!z.a?'only-b':(z.c.crit||z.c.warn)?'diff':z.c.info?'minor':'same'});
+const ST={'same':['Identical','ok'],'minor':['Minor differences','info'],'diff':['Different','warn'],'only-a':['Only on source','crit'],'only-b':['Only on target','info']};
+const realZ=ZR.filter(z=>!(z.a||z.b).auto),same=realZ.filter(z=>z.st==='same'||z.st==='minor').length;
+const setW=R.filter(r=>(r.cat==='Server'||r.cat==='All settings'||r.cat==='Forwarders')&&r.sev!=='info').length;
+const verdict=nC?['Not equivalent','crit']:nW?['Review the differences','warn']:['Equivalent','ok'];
+const who=(i,x)=>i.kind==='baseline'||i.kind==='report'?`${esc(i.name||x.server)} (${i.kind} ${esc(i.saved||x.generated)})`:esc(i.name||x.server);
+
+$('#sub').innerHTML=`Compare &middot; ${who(AI,A)} &rarr; ${esc(nameB)} &middot; ${esc(D.generated)}`;
+if(D.demo)$('#demo').innerHTML='<span class="demo">DEMO DATA</span>';
+$('#ft').innerHTML=`DNS Analyzer by <b>Starkark98</b> &middot; comparison ${esc(nameA)} &rarr; ${esc(nameB)} &middot; generated ${esc(D.generated)} &middot; read-only report`;
+$('#q').placeholder='Filter the differences...  ( / )';
+const K=[['Verdict',verdict[0],verdict[1],'diff','sm'],['Critical',nC,nC?'crit':'ok','diff'],['Warnings',nW,nW?'warn':'ok','diff'],['Info',nI,nI?'info':'ok','diff'],
+  ['Zones identical',`${same} / ${realZ.length}`,same===realZ.length?'ok':'warn','czones'],['Static records missing on target',fmt(statMiss),statMiss?'crit':'ok','diff'],['Setting differences',setW,setW?'warn':'ok','diff']];
+let h='<div class="kpi">'+K.map(k=>`<div class="k ${k[2]}" data-go="${k[3]}"><span>${k[0]}</span><b class="${k[4]||''}">${k[1]}</b></div>`).join('')+'</div>';
+const cats=[...new Set(R.map(r=>r.cat))];
+h+=sec('diff','Differences',badge(R.length,nC?'crit':nW?'warn':'ok'),
+  chips('sevf',[['all','All',R.length],['crit','Critical',nC],['warn','Warnings',nW],['info','Info',nI]])+chips('catf',[['all','All categories',R.length],...cats.map(c=>[c,esc(c),R.filter(r=>r.cat===c).length])])+
+  `<div id="dg"></div><div class="mut hint">Critical = present on the source and missing on the target. Warning = different. Info = only on the target, or cosmetic (names, addresses, versions, record counts). Dynamic records are summarized per zone: clients register them again on the new server.${NEW?'':' <b>'+OLDNOTE+'</b>'}</div>`,true);
+h+=sec('czones','Zones',badge(realZ.length),
+  chips('zsf',[['all','All',ZR.length],['diff','With differences',ZR.filter(z=>z.st!=='same').length],['only-a','Only on source',ZR.filter(z=>z.st==='only-a').length],['only-b','Only on target',ZR.filter(z=>z.st==='only-b').length]])+
+  `<div class="wrap"><table><thead><tr><th></th><th>Zone</th><th>Type (source &rarr; target)</th><th class="num">Records source</th><th class="num">Records target</th><th>Status</th><th class="num">Critical</th><th class="num">Warnings</th><th class="num">Info</th></tr></thead><tbody id="czt"></tbody></table></div>
+  <div class="mut hint">Click a zone to show only its differences.</div>`,true);
+const info=(i,x)=>`<div class="kv">${kv('Source',i.kind==='baseline'?'Baseline file':i.kind==='report'?'Analysis report':'Live server')}${kv('Server',esc(x.server))}${kv('Data collected',esc(x.generated))}${i.saved&&i.kind==='baseline'?kv('Baseline saved',esc(i.saved)):''}${kv('DNS Analyzer version',esc(i.version)||'n/a')}${kv('DNS server version',esc(x.settings.version)||'n/a')}
+  ${kv('Zones',fmt(x.zones.filter(z=>!z.auto).length))}${kv('Resource records',fmt(x.zones.reduce((s,z)=>s+N(z.total),0)))}${kv('Policies',fmt(x.policies.length+x.zones.reduce((s,z)=>s+z.pol.length,0)))}</div>`;
+h+=sec('srcs','Sources',`<span class="mut">${who(AI,A)} &rarr; ${esc(nameB)}</span>`,`<h3>Source (old)</h3>${info(AI,A)}<h3>Target (new)</h3>${info(BI,B)}
+  <div class="mut hint">The comparison covers the configuration: server settings, forwarders, root hints, zones and their records, policies, partitions and DNSSEC. Logs, statistics and live tests are not compared.${NEW?'':' '+OLDNOTE}</div>`,false);
+$('#m').innerHTML=h;
+
+let sevF='all',catF='all',zoneF='',q='';
+const SEVP=r=>`<span class="pill ${r.sev}">${SEVL[r.sev]}</span>`;
+const cell=v=>v===NOT||v==='missing'?'<span class="mut">'+esc(v)+'</span>':esc(v);
+const grid=makeGrid($('#dg'),[{k:'sev',t:'Severity',sv:r=>SEV[r.sev],f:SEVP},{k:'cat',t:'Category'},{k:'obj',t:'Object',brk:1},{k:'item',t:'Item',brk:1},
+  {k:'a',t:'Source (old)',brk:1,f:r=>cell(r.a)},{k:'b',t:'Target (new)',brk:1,f:r=>cell(r.b)}],R,{empty:'No differences: the target matches the source',max:2000});
+const apply=()=>grid.setRows(R.filter(r=>(sevF==='all'||r.sev===sevF)&&(catF==='all'||r.cat===catF)&&(!zoneF||r.zone===zoneF)));
+function renderZ(f){
+  $('#czt').innerHTML=ZR.filter(z=>f==='all'||(f==='diff'?z.st!=='same':z.st===f)).map(z=>{const x=z.a||z.b,s=ST[z.st];
+    return `<tr class="sc" data-zn="${esc(z.name)}"><td><span class="dot ${s[1]==='ok'?'':s[1]}"></span></td><td><b>${esc(z.name)}</b>${x.auto?' <span class="pill">auto-created</span>':''}</td>
+      <td>${esc(z.a?z.a.type:'-')} &rarr; ${esc(z.b?z.b.type:'-')}</td><td class="num">${z.a?fmt(z.a.total):'<span class="mut">&ndash;</span>'}</td><td class="num">${z.b?fmt(z.b.total):'<span class="mut">&ndash;</span>'}</td>
+      <td><span class="pill ${s[1]}">${s[0]}</span></td><td class="num">${z0(z.c.crit)}</td><td class="num">${z0(z.c.warn)}</td><td class="num">${z0(z.c.info)}</td></tr>`}).join('')||'<tr><td colspan="9" class="mut">No zones</td></tr>';
+}
+renderZ('all');
+
+document.addEventListener('click',e=>{
+  let t;
+  if((t=e.target.closest('.sec>h2'))){t.parentNode.classList.toggle('open');return}
+  if((t=e.target.closest('[data-go]'))){const s=document.getElementById(t.dataset.go);s.classList.add('open');s.scrollIntoView({behavior:'smooth',block:'start'});return}
+  if((t=e.target.closest('.chips[data-for] button'))){const p=t.parentNode;p.querySelectorAll('button').forEach(b=>b.classList.toggle('on',b===t));
+    if(p.dataset.for==='sevf')sevF=t.dataset.f;else if(p.dataset.for==='catf')catF=t.dataset.f;else{renderZ(t.dataset.f);return}
+    apply();return}
+  if((t=e.target.closest('tr.sc[data-zn]'))){zoneF=zoneF===t.dataset.zn?'':t.dataset.zn;document.querySelectorAll('tr.sc[data-zn]').forEach(r=>r.classList.toggle('exp',r.dataset.zn===zoneF));
+    apply();const s=$('#diff');s.classList.add('open');s.scrollIntoView({behavior:'smooth',block:'start'})}
+});
+$('#bx').onclick=()=>document.querySelectorAll('.sec').forEach(s=>s.classList.add('open'));
+$('#bc').onclick=()=>document.querySelectorAll('.sec').forEach(s=>s.classList.remove('open'));
+let tmr;$('#q').oninput=e=>{clearTimeout(tmr);tmr=setTimeout(()=>{q=e.target.value;grid.setQ(q);const s=$('#diff');s.classList.add('open')},200)};
+window.CMP={R,ZR};
+}
+
 document.addEventListener('keydown',e=>{if(e.key==='/'&&document.activeElement.tagName!=='INPUT'){e.preventDefault();$('#q').focus()}});
+if(D.mode==='compare')runCompare();else runAnalyze();
 </script></body></html>
 '@
 
@@ -1156,6 +1544,77 @@ function Save-Report([string]$json, [string]$server, [string]$path) {
     if ($dir -and -not (Test-Path -LiteralPath $dir)) { [void](New-Item -Path $dir -ItemType Directory -Force) }
     [IO.File]::WriteAllText($path, (Build-Html $json), [Text.UTF8Encoding]::new($false))
     $path
+}
+
+# ---- names, baselines and comparisons ----
+$ServerNamePattern = '^[A-Za-z0-9_][A-Za-z0-9._:-]{0,252}$'
+function Test-ServerName([string]$name) { "$name" -match $ServerNamePattern }
+# Same server written twice (also DC01 vs DC01.contoso.local)
+function Test-SameServer([string]$a, [string]$b) {
+    $a = "$a".Trim().TrimEnd('.').ToLower(); $b = "$b".Trim().TrimEnd('.').ToLower()
+    if ($a -eq $b) { return $true }
+    $ip = '^\d+\.\d+\.\d+\.\d+$'
+    ($a -notmatch $ip -and $b -notmatch $ip -and $a.Split('.')[0] -eq $b.Split('.')[0] -and (-not $a.Contains('.') -or -not $b.Contains('.')))
+}
+# A baseline is the analysis data wrapped with the tool name and version, so that a file from another tool is refused
+function Save-Baseline([string]$json, [string]$server, [string]$path) {
+    $path = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($path.Trim())
+    if ([IO.Path]::GetExtension($path) -ne '.json') { throw "The baseline file name must end in .json: $path" }
+    $dir = Split-Path $path -Parent
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) { [void](New-Item -Path $dir -ItemType Directory -Force) }
+    $w = '{"tool":"DnsAnalyzer","version":' + (ConvertTo-Json $AppVersion) + ',"saved":' + (ConvertTo-Json (Get-Date -Format 'yyyy-MM-dd HH:mm')) + ',"server":' + (ConvertTo-Json "$server") + ',"data":' + $json + '}'
+    [IO.File]::WriteAllText($path, $w, [Text.UTF8Encoding]::new($false))
+    $path
+}
+function Read-Baseline([string]$path) {
+    $path = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath("$path".Trim())
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Baseline file not found: $path" }
+    if ((Get-Item -LiteralPath $path).Length -gt 300MB) { throw "The baseline file is too large (over 300 MB): $path" }
+    # .NET serializer with no length limit (ConvertFrom-Json of older Windows PowerShell versions stops at a few MB, and is slower)
+    Add-Type -AssemblyName System.Web.Extensions
+    $js = [Web.Script.Serialization.JavaScriptSerializer]::new(); $js.MaxJsonLength = [int]::MaxValue; $js.RecursionLimit = 256
+    $isMap = { param($x) $x -is [Collections.Generic.IDictionary[string, object]] }
+    $text = [IO.File]::ReadAllText($path)
+    if ([IO.Path]::GetExtension($path) -match '^\.html?$') {
+        # an analysis report of this tool: its data is the "const D=" line of the page script
+        $title = [regex]::Match($text, '(?i)<title>\s*([^<]*?)\s*</title>').Groups[1].Value
+        if ($title -notmatch '^DNS Analyzer by Starkark98') {
+            if ($title -match '^(.+?) by Starkark98') { throw "This report was created by $($matches[1]), not by DNS Analyzer: $path" }
+            throw "Not a DNS Analyzer report: $path"
+        }
+        $i = $text.IndexOf('const D=')
+        if ($i -lt 0) { throw "Not a DNS Analyzer report: $path" }
+        $j = $text.IndexOf("`n", $i); if ($j -lt 0) { $j = $text.Length }
+        $line = $text.Substring($i + 8, $j - $i - 8).TrimEnd("`r", ' ').TrimEnd(';')
+        try { $data = $js.DeserializeObject($line) } catch { throw "The report file is incomplete or damaged: $path" }
+        if ((& $isMap $data) -and "$($data['mode'])" -eq 'compare') { throw "This is a comparison report: choose the report of an analysis, or a baseline .json: $path" }
+        if (-not (& $isMap $data) -or -not $data.ContainsKey('zones') -or -not "$($data['server'])") { throw "The report file is incomplete or damaged: $path" }
+        $info = [pscustomobject]@{ kind = 'report'; server = "$($data['server'])"; saved = "$($data['generated'])"; version = '' }
+    } else {
+        try { $o = $js.DeserializeObject($text) } catch { throw "Not a valid baseline file (it is not JSON): $path" }
+        if (-not (& $isMap $o) -or "$($o['tool'])" -ne 'DnsAnalyzer') {
+            if ((& $isMap $o) -and "$($o['tool'])") { throw "This baseline was saved by $($o['tool']), not by DNS Analyzer: $path" }
+            throw "Not a DNS Analyzer baseline: $path"
+        }
+        $data = $o['data']
+        if (-not (& $isMap $data) -or -not $data.ContainsKey('zones') -or -not "$($data['server'])") { throw "The baseline file is incomplete or damaged: $path" }
+        $info = [pscustomobject]@{ kind = 'baseline'; server = "$($o['server'])"; saved = "$($o['saved'])"; version = "$($o['version'])" }
+    }
+    # re-serialized from the parsed object: what reaches the page is always plain JSON.
+    # partial: created by 1.0.x, without the data added in 1.1.0 (the comparison skips those categories)
+    [pscustomobject]@{ path = $path; json = $js.Serialize($data); kind = $info.kind; server = $info.server; saved = $info.saved; version = $info.version; partial = -not $data.ContainsKey('cfg') }
+}
+function New-SourceInfo([string]$kind, [string]$name, [string]$saved, [string]$version) {
+    [pscustomobject]@{ kind = $kind; name = $name; saved = $saved; version = $version }
+}
+function Build-CompareJson([string]$aJson, [string]$bJson, $aInfo, $bInfo, [bool]$demo, [bool]$aPartial = $false) {
+    '{"mode":"compare","generated":' + (ConvertTo-Json (Get-Date -Format 'yyyy-MM-dd HH:mm')) + ',"demo":' + $(if ($demo) { 'true' } else { 'false' }) + ',"aPartial":' + $(if ($aPartial) { 'true' } else { 'false' }) +
+        ',"aInfo":' + ($aInfo | ConvertTo-Json -Compress) + ',"bInfo":' + ($bInfo | ConvertTo-Json -Compress) + ',"a":' + $aJson + ',"b":' + $bJson + '}'
+}
+function Get-DemoJson([string]$variant, [bool]$light) {
+    $d = New-DemoData $variant
+    if ($light) { $d.logs = $null; $d.stats = $null; $d.tests = @(); $d.forwarders = @(); $d.scanned = $false; $d.light = $true; foreach ($z in $d.zones) { $z.scan = $null } }
+    $d | ConvertTo-Json -Depth 8 -Compress
 }
 function Find-Browser {
     $cands = @(
@@ -1193,27 +1652,64 @@ $NoBrowserMsg = "Report created, but no modern browser (Edge, Chrome or Firefox)
 # =============================================================================
 #  DEMO AND COMMAND-LINE MODES
 # =============================================================================
+function Open-Or-Warn([string]$path, [string]$what) {
+    if ($NoOpen) { return }
+    if (-not (Open-Report $path)) {
+        try { Start-Process explorer.exe "/select,`"$path`"" } catch { }
+        Show-Message "The $what was created, but no modern browser (Edge, Chrome or Firefox) was found on this PC. Internet Explorer cannot display it.`n`nThe file is now selected in File Explorer: copy it to a PC with Edge or Chrome and open it there.`n`n$path"
+    }
+}
+if ($DemoCompare) {
+    try {
+        $json = Build-CompareJson (Get-DemoJson 'source' $true) (Get-DemoJson 'target' $true) (New-SourceInfo 'server' 'DC01.contoso.local' '' $AppVersion) (New-SourceInfo 'server' 'DNS-NEW01.contoso.local' '' $AppVersion) $true
+        $path = Save-Report $json 'DEMO-COMPARE' $OutHtml
+        Write-Host "Demo comparison: $path" -ForegroundColor Green
+        Open-Or-Warn $path 'demo comparison'
+    } catch { if ($NoGui -or $NoOpen) { Write-Error $_.Exception.Message } else { Show-Message "The demo comparison could not be created:`n$($_.Exception.Message)" 'Error' } }
+    return
+}
 if ($Demo) {
     try {
-        $path = Save-Report ((New-DemoData) | ConvertTo-Json -Depth 8 -Compress) 'DEMO' $OutHtml
+        $json = Get-DemoJson 'source' $false
+        $path = Save-Report $json 'DEMO' $OutHtml
         Write-Host "Demo dashboard: $path" -ForegroundColor Green
-        if ($NoOpen) { return }
-        if (-not (Open-Report $path)) {
-            try { Start-Process explorer.exe "/select,`"$path`"" } catch { }
-            Show-Message "The demo dashboard was created, but no modern browser (Edge, Chrome or Firefox) was found on this PC. Internet Explorer cannot display it.`n`nThe file is now selected in File Explorer: copy it to a PC with Edge or Chrome and open it there.`n`n$path"
-        }
-    } catch { Show-Message "The demo could not be created:`n$($_.Exception.Message)" 'Error' }
+        if ($SaveBaseline) { Write-Host "Baseline: $(Save-Baseline $json 'DC01.contoso.local' $SaveBaseline)" -ForegroundColor Green }
+        Open-Or-Warn $path 'demo dashboard'
+    } catch { if ($NoGui -or $NoOpen) { Write-Error $_.Exception.Message } else { Show-Message "The demo could not be created:`n$($_.Exception.Message)" 'Error' } }
     return
 }
 
 if ($NoGui) {
-    while (-not $DnsServer) { $DnsServer = (Read-Host 'DNS server name').Trim() }
-    $sync = [hashtable]::Synchronized(@{ Status = ''; Progress = 0; Done = $false; Error = $null; Json = $null })
-    Write-Host "Analyzing $DnsServer..." -ForegroundColor Cyan
-    & $Collector $DnsServer (-not $SkipLiveTests) $ExternalName $sync
-    if ($sync.Error) { Write-Error $sync.Error; return }
-    $path = Save-Report $sync.Json $DnsServer $OutHtml
-    Write-Host "Dashboard: $path" -ForegroundColor Green
+    # one collection in this process; $label names the server in error messages of a comparison
+    function Invoke-Collect([string]$srv, [bool]$scan, [bool]$light, [string]$label) {
+        $sync = [hashtable]::Synchronized(@{ Status = ''; Progress = 0; Done = $false; Error = $null; Json = $null })
+        Write-Host "$(if ($label) { "$label - " })Reading $srv..." -ForegroundColor Cyan
+        & $Collector $srv $scan $ExternalName $sync $light
+        if ($sync.Error) { throw "$(if ($label) { "$label server $srv could not be read: " })$($sync.Error)" }
+        $sync.Json
+    }
+    try {
+        if ($CompareWith) {
+            if ($Baseline -and $DnsServer) { throw 'Use either -DnsServer or -Baseline as the source of the comparison, not both.' }
+            if ($Baseline) {
+                $b = Read-Baseline $Baseline
+                $aJson = $b.json; $aInfo = New-SourceInfo $b.kind $b.server $b.saved $b.version; $aName = $b.server; $aPartial = $b.partial
+            } elseif ($DnsServer) {
+                if (Test-SameServer $DnsServer $CompareWith) { throw "Source and target are the same server ($DnsServer): choose two different servers, or compare with a baseline (-Baseline)." }
+                $aJson = Invoke-Collect $DnsServer $false $true 'Source (old)'; $aInfo = New-SourceInfo 'server' $DnsServer '' $AppVersion; $aName = $DnsServer
+            } else { throw 'A comparison needs a source: -DnsServer <old server> or -Baseline <file.json or report.html>.' }
+            $bJson = Invoke-Collect $CompareWith $false $true 'Target (new)'
+            $path = Save-Report (Build-CompareJson $aJson $bJson $aInfo (New-SourceInfo 'server' $CompareWith '' $AppVersion) $false ([bool]$aPartial)) "$aName-vs-$CompareWith" $OutHtml
+            Write-Host "Comparison: $path" -ForegroundColor Green
+        } else {
+            if ($Baseline) { throw '-Baseline is used with -CompareWith <server>.' }
+            while (-not $DnsServer) { $DnsServer = (Read-Host 'DNS server name').Trim(); if ($DnsServer -and -not (Test-ServerName $DnsServer)) { Write-Warning 'Invalid server name.'; $DnsServer = '' } }
+            $json = Invoke-Collect $DnsServer (-not $SkipLiveTests) $false ''
+            $path = Save-Report $json $DnsServer $OutHtml
+            Write-Host "Dashboard: $path" -ForegroundColor Green
+            if ($SaveBaseline) { Write-Host "Baseline: $(Save-Baseline $json $DnsServer $SaveBaseline)" -ForegroundColor Green }
+        }
+    } catch { Write-Error $_.Exception.Message; return }
     if (-not $NoOpen -and -not (Open-Report $path)) { Write-Warning $NoBrowserMsg }
     return
 }
@@ -1225,10 +1721,12 @@ $isAdmin = $false
 try { $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) } catch { }
 $relArgs = "-NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File `"$PSCommandPath`" -NoElevate"
 if ($DnsServer) { $relArgs += " -DnsServer `"$DnsServer`"" }
+if ($CompareWith) { $relArgs += " -CompareWith `"$CompareWith`"" }
 if ($SkipLiveTests) { $relArgs += ' -SkipLiveTests' }
 if ($PSBoundParameters.ContainsKey('ExternalName')) { $relArgs += " -ExternalName `"$ExternalName`"" }
 # Resolved now: the elevated process starts in System32, where a relative path would point somewhere else
 if ($OutHtml) { $OutHtml = Resolve-OutHtml $OutHtml; $relArgs += " -OutHtml `"$($OutHtml -replace '\\$', '\\')`"" }
+if ($Baseline) { $Baseline = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Baseline.Trim()); $relArgs += " -Baseline `"$Baseline`"" }
 if (-not $isAdmin -and -not $NoElevate) {
     try { Start-Process powershell.exe -Verb RunAs -ArgumentList $relArgs; return }
     catch { }   # UAC declined: continue without elevation
@@ -1242,11 +1740,11 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 [xml]$xaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="DNS Analyzer - by Starkark98" Width="540" SizeToContent="Height" WindowStartupLocation="CenterScreen"
+        Title="DNS Analyzer - by Starkark98" Width="560" SizeToContent="Height" WindowStartupLocation="CenterScreen"
         ResizeMode="CanMinimize" Background="#F4F5F7" FontFamily="Segoe UI" FontSize="13">
   <Border Margin="16" Padding="24" Background="White" CornerRadius="10">
     <StackPanel>
-      <Grid Margin="0,0,0,20">
+      <Grid Margin="0,0,0,18">
         <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
         <Image x:Name="ImgLogo" Width="68" Height="68" Margin="0,0,16,0" VerticalAlignment="Center" RenderOptions.BitmapScalingMode="HighQuality"/>
         <StackPanel Grid.Column="1" VerticalAlignment="Center">
@@ -1259,13 +1757,33 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
                      Foreground="#6B7280" TextWrapping="Wrap" Margin="0,4,0,0"/>
         </StackPanel>
       </Grid>
-      <TextBlock Text="DNS server" FontWeight="SemiBold" Foreground="#1F2328"/>
-      <ComboBox x:Name="CmbServer" IsEditable="True" FontSize="15" Padding="6" Margin="0,6,0,14"/>
-      <CheckBox x:Name="ChkScan" IsChecked="True" Foreground="#1F2328">
-        <TextBlock TextWrapping="Wrap">Run live tests: name servers, forwarders, resolution, liveness of static and stale records (DNS queries, ping, ports)</TextBlock>
-      </CheckBox>
-      <TextBlock Text="Takes a few extra minutes. ARP works only for subnets this PC is connected to."
-                 Foreground="#6B7280" FontSize="12" TextWrapping="Wrap" Margin="22,2,0,0"/>
+      <StackPanel Orientation="Horizontal" Margin="0,0,0,14">
+        <RadioButton x:Name="RbAnalyze" GroupName="Mode" IsChecked="True" Content="Analyze a server" Foreground="#1F2328" Margin="0,0,24,0" Cursor="Hand"/>
+        <RadioButton x:Name="RbCompare" GroupName="Mode" Content="Compare two servers (migration)" Foreground="#1F2328" Cursor="Hand"/>
+      </StackPanel>
+      <StackPanel x:Name="PnlAnalyze">
+        <TextBlock Text="DNS server" FontWeight="SemiBold" Foreground="#1F2328"/>
+        <ComboBox x:Name="CmbServer" IsEditable="True" FontSize="15" Padding="6" Margin="0,6,0,14"/>
+        <CheckBox x:Name="ChkScan" IsChecked="True" Foreground="#1F2328">
+          <TextBlock TextWrapping="Wrap">Run live tests: name servers, delegations, forwarders, resolution, liveness of static and stale records (DNS queries, ping, ports)</TextBlock>
+        </CheckBox>
+        <TextBlock Text="Takes a few extra minutes. ARP works only for subnets this PC is connected to."
+                   Foreground="#6B7280" FontSize="12" TextWrapping="Wrap" Margin="22,2,0,0"/>
+      </StackPanel>
+      <StackPanel x:Name="PnlCompare" Visibility="Collapsed">
+        <TextBlock Text="Source (old)" FontWeight="SemiBold" Foreground="#1F2328"/>
+        <Grid Margin="0,6,0,2">
+          <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+          <ComboBox x:Name="CmbSource" IsEditable="True" FontSize="15" Padding="6"/>
+          <Button x:Name="BtnBrowse" Grid.Column="1" Content="Baseline..." Margin="8,0,0,0" Padding="12,0" Cursor="Hand"
+                  ToolTip="Use a baseline file saved earlier (for example from a server that is already switched off) as the source"/>
+        </Grid>
+        <TextBlock Text="Server name, a baseline saved earlier (.json) or an analysis report (.html)" Foreground="#6B7280" FontSize="12" Margin="0,0,0,12"/>
+        <TextBlock Text="Target (new)" FontWeight="SemiBold" Foreground="#1F2328"/>
+        <ComboBox x:Name="CmbTarget" IsEditable="True" FontSize="15" Padding="6" Margin="0,6,0,2"/>
+        <TextBlock Text="Reads the configuration of both: zones, records, settings, policies. No logs and no live tests."
+                   Foreground="#6B7280" FontSize="12" TextWrapping="Wrap"/>
+      </StackPanel>
       <Button x:Name="BtnRun" Content="Analyze" Height="40" Margin="0,22,0,0" FontSize="15" FontWeight="SemiBold"
               IsDefault="True" Background="#2563EB" Foreground="White" BorderThickness="0" Cursor="Hand"/>
       <Button x:Name="BtnDemo" Content="No server at hand? Try the demo with sample data" Margin="0,10,0,0" Padding="0,4"
@@ -1274,9 +1792,10 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
       <TextBox x:Name="TxtStatus" Margin="0,8,0,0" Foreground="#4B5563" TextWrapping="Wrap" IsReadOnly="True"
                BorderThickness="0" Background="Transparent" Padding="0"/>
       <WrapPanel x:Name="PnlDone" Margin="0,14,0,0" Visibility="Collapsed">
-        <Button x:Name="BtnOpen" Content="Open dashboard" Padding="14,6" Margin="0,0,8,0" Cursor="Hand"/>
-        <Button x:Name="BtnSave" Content="Save as..." Padding="14,6" Margin="0,0,8,0" Cursor="Hand"/>
-        <Button x:Name="BtnFolder" Content="Show in folder" Padding="14,6" Cursor="Hand"/>
+        <Button x:Name="BtnOpen" Content="Open dashboard" Padding="14,6" Margin="0,0,8,8" Cursor="Hand"/>
+        <Button x:Name="BtnBaseline" Content="Save baseline..." Padding="14,6" Margin="0,0,8,8" Cursor="Hand"/>
+        <Button x:Name="BtnSave" Content="Save as..." Padding="14,6" Margin="0,0,8,8" Cursor="Hand"/>
+        <Button x:Name="BtnFolder" Content="Show in folder" Padding="14,6" Margin="0,0,0,8" Cursor="Hand"/>
       </WrapPanel>
     </StackPanel>
   </Border>
@@ -1286,7 +1805,8 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 try { $win = [Windows.Markup.XamlReader]::Load([Xml.XmlNodeReader]::new($xaml)) }
 catch { Show-Message "DNS Analyzer could not open its window:`n$($_.Exception.Message)" 'Error'; return }
 $ui  = @{}
-'CmbServer', 'ChkScan', 'BtnRun', 'BtnDemo', 'Bar', 'TxtStatus', 'PnlDone', 'BtnOpen', 'BtnSave', 'BtnFolder', 'TxtVer' | ForEach-Object { $ui[$_] = $win.FindName($_) }
+'RbAnalyze', 'RbCompare', 'PnlAnalyze', 'PnlCompare', 'CmbServer', 'CmbSource', 'CmbTarget', 'BtnBrowse', 'ChkScan', 'BtnRun', 'BtnDemo', 'Bar', 'TxtStatus',
+'PnlDone', 'BtnOpen', 'BtnBaseline', 'BtnSave', 'BtnFolder', 'TxtVer' | ForEach-Object { $ui[$_] = $win.FindName($_) }
 $ui.TxtVer.Text = "v$AppVersion"
 function ConvertTo-Image([string]$b64) {
     $bi = [Windows.Media.Imaging.BitmapImage]::new()
@@ -1297,21 +1817,93 @@ try { $win.Icon = ConvertTo-Image $IconPng; $win.FindName('ImgLogo').Source = Co
 
 $cfgDir   = Join-Path $env:APPDATA 'DnsAnalyzer'
 $lastFile = Join-Path $cfgDir 'last.txt'
-$script:report = $null; $script:job = $null
+$lastTarget = Join-Path $cfgDir 'last-target.txt'
+$script:report = $null; $script:job = $null; $script:run = $null
 
 function Set-Status([string]$text, [bool]$isError = $false) {
     $ui.TxtStatus.Text = $text
     $ui.TxtStatus.Foreground = if ($isError) { [Windows.Media.Brushes]::Firebrick } else { [Windows.Media.Brushes]::DimGray }
 }
 function Set-Busy([bool]$busy) {
-    $ui.CmbServer.IsEnabled = -not $busy; $ui.ChkScan.IsEnabled = -not $busy
-    $ui.BtnRun.IsEnabled = -not $busy; $ui.BtnDemo.IsEnabled = -not $busy
+    'CmbServer', 'CmbSource', 'CmbTarget', 'BtnBrowse', 'ChkScan', 'BtnRun', 'BtnDemo', 'RbAnalyze', 'RbCompare' | ForEach-Object { $ui[$_].IsEnabled = -not $busy }
     $ui.Bar.Visibility = if ($busy) { 'Visible' } else { 'Collapsed' }
     if ($busy) { $ui.PnlDone.Visibility = 'Collapsed'; $ui.Bar.Value = 0 }
 }
 function Show-Report([string]$okText) {
     $ui.PnlDone.Visibility = 'Visible'
+    $ui.BtnBaseline.Visibility = if ($script:run.mode -eq 'analyze') { 'Visible' } else { 'Collapsed' }
     if (Open-Report $script:report) { Set-Status $okText } else { Set-Status $NoBrowserMsg $true }
+}
+function Set-Mode {
+    $cmp = [bool]$ui.RbCompare.IsChecked
+    $ui.PnlAnalyze.Visibility = if ($cmp) { 'Collapsed' } else { 'Visible' }
+    $ui.PnlCompare.Visibility = if ($cmp) { 'Visible' } else { 'Collapsed' }
+    $ui.BtnRun.Content = if ($cmp) { 'Compare' } else { 'Analyze' }
+    $ui.BtnDemo.Content = if ($cmp) { 'No servers at hand? Try the comparison demo with sample data' } else { 'No server at hand? Try the demo with sample data' }
+}
+$ui.RbAnalyze.Add_Checked({ Set-Mode }); $ui.RbCompare.Add_Checked({ Set-Mode })
+
+# What to run, from the fields of the window. Returns the plan, or throws a message for the user.
+function Get-RunPlan {
+    if (-not $ui.RbCompare.IsChecked) {
+        $srv = "$($ui.CmbServer.Text)".Trim()
+        if (-not $srv) { throw 'Enter the DNS server name.' }
+        if (-not (Test-ServerName $srv)) { throw "Invalid server name '$srv': use only letters, digits, dots and hyphens, or an IP address." }
+        return @{ mode = 'analyze'; name = $srv; baseline = $null; sig = "analyze|$($srv.ToLower())|$([bool]$ui.ChkScan.IsChecked)"; steps = @(@{ label = ''; server = $srv; scan = [bool]$ui.ChkScan.IsChecked; light = $false }) }
+    }
+    $src = "$($ui.CmbSource.Text)".Trim(); $tgt = "$($ui.CmbTarget.Text)".Trim()
+    if (-not $src) { throw 'Enter the source (old) server, or choose a baseline file with Baseline...' }
+    if (-not $tgt) { throw 'Enter the target (new) server.' }
+    if (-not (Test-ServerName $tgt)) { throw "Invalid target server name '$tgt': use only letters, digits, dots and hyphens, or an IP address." }
+    if ($src -match '(?i)\.(json|html?)$' -or $src -match '[\\/]') {
+        $full = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($src)
+        return @{ mode = 'compare'; name = "$([IO.Path]::GetFileNameWithoutExtension($src))-vs-$tgt"; baseline = $src; target = $tgt; sig = "compare|file|$($full.ToLower())|$($tgt.ToLower())"; steps = @(@{ label = 'Target (new)'; server = $tgt; scan = $false; light = $true }) }
+    }
+    if (-not (Test-ServerName $src)) { throw "Invalid source server name '$src': use only letters, digits, dots and hyphens, an IP address, or a baseline file (.json or .html)." }
+    if (Test-SameServer $src $tgt) { throw "Source and target are the same server ($src): choose two different servers, or compare the server with a baseline saved earlier." }
+    @{ mode = 'compare'; name = "$src-vs-$tgt"; baseline = $null; source = $src; target = $tgt; sig = "compare|$($src.ToLower())|$($tgt.ToLower())"
+        steps = @(@{ label = 'Source (old)'; server = $src; scan = $false; light = $true }, @{ label = 'Target (new)'; server = $tgt; scan = $false; light = $true }) }
+}
+function Start-Step {
+    $s = $script:run.steps[$script:step]
+    $script:sync   = [hashtable]::Synchronized(@{ Status = 'Starting analysis...'; Progress = 0; Done = $false; Error = $null; Json = $null })
+    $script:job    = [powershell]::Create()
+    [void]$script:job.AddScript($Collector.ToString()).AddArgument($s.server).AddArgument([bool]$s.scan).AddArgument($ExternalName).AddArgument($script:sync).AddArgument([bool]$s.light)
+    $script:handle = $script:job.BeginInvoke()
+    $timer.Start()
+}
+# Runs a plan. With the same inputs as the last run, the plan carries the same report path and the file is updated
+function Start-Run($plan) {
+    $script:run = $plan; $script:run.results = @(); $script:step = 0
+    Set-Busy $true
+    if ($plan.demo) {
+        try {
+            $json = if ($plan.mode -eq 'compare') { Build-CompareJson (Get-DemoJson 'source' $true) (Get-DemoJson 'target' $true) (New-SourceInfo 'server' 'DC01.contoso.local' '' $AppVersion) (New-SourceInfo 'server' 'DNS-NEW01.contoso.local' '' $AppVersion) $true } else { Get-DemoJson 'source' $false }
+            $script:lastJson = $json; $script:lastServer = 'DC01.contoso.local'
+            $script:report = Save-Report $json $plan.name $(if ($plan.path) { $plan.path } else { $null }); $plan.path = $script:report
+            Set-Busy $false; Show-Report $(if ($plan.mode -eq 'compare') { 'Comparison demo opened in your browser (fictitious data).' } else { 'Demo dashboard opened in your browser (fictitious data).' })
+        } catch { Set-Busy $false; Set-Status "Error: $($_.Exception.Message)" $true }
+        return
+    }
+    if ($plan.baseline) {
+        try { Set-Status 'Reading the baseline file...'; $script:run.base = Read-Baseline $plan.baseline }
+        catch { Set-Busy $false; Set-Status "Baseline: $($_.Exception.Message)" $true; return }
+    }
+    Start-Step
+}
+function Complete-Run {
+    $r = $script:run
+    if ($r.mode -eq 'analyze') { $json = $r.results[0]; $script:lastJson = $json; $script:lastServer = $r.steps[0].server }
+    else {
+        if ($r.base) { $aJson = $r.base.json; $aInfo = New-SourceInfo $r.base.kind $r.base.server $r.base.saved $r.base.version; $bJson = $r.results[0] }
+        else { $aJson = $r.results[0]; $aInfo = New-SourceInfo 'server' $r.source '' $AppVersion; $bJson = $r.results[1] }
+        $json = Build-CompareJson $aJson $bJson $aInfo (New-SourceInfo 'server' $r.target '' $AppVersion) $false ([bool]($r.base -and $r.base.partial))
+    }
+    $script:report = Save-Report $json $r.name $(if ($r.path) { $r.path } else { $OutHtml }); $r.path = $script:report
+    $script:lastSig = $r.sig; $script:lastPath = $script:report
+    Set-Busy $false
+    $what = if ($r.mode -eq 'analyze') { 'Analysis' } else { 'Comparison' }
+    Show-Report $(if ($r.reused) { "$what completed. Same inputs as before: the report was updated (press F5 if the tab is already open)." } else { "$what completed. Dashboard opened in your browser." })
 }
 
 # Domain controllers of the current domain + DNS servers configured on this PC + last server used
@@ -1319,49 +1911,69 @@ $win.Add_ContentRendered({
     $names = [Collections.Generic.List[string]]::new()
     try { [DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain().DomainControllers | ForEach-Object { $names.Add("$($_.Name)") } } catch { }
     try { Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction Stop | ForEach-Object { $_.ServerAddresses } | ForEach-Object { $names.Add("$_") } } catch { }
-    $names | Where-Object { $_ } | Select-Object -Unique | ForEach-Object { [void]$ui.CmbServer.Items.Add($_) }
+    foreach ($n in ($names | Where-Object { $_ } | Select-Object -Unique)) { foreach ($c in 'CmbServer', 'CmbSource', 'CmbTarget') { [void]$ui[$c].Items.Add($n) } }
     if (-not (Get-Module -ListAvailable DnsServer)) { Set-Status 'DnsServer module not found: install the RSAT "DNS Server Tools" to analyze a server. The demo works anyway.' $true }
 })
 if ($DnsServer) { $ui.CmbServer.Text = $DnsServer }
-elseif (Test-Path -LiteralPath $lastFile) { try { $last = "$(Get-Content -LiteralPath $lastFile -Raw)".Trim(); if ($last -match '^[A-Za-z0-9_][A-Za-z0-9._:-]{0,252}$') { $ui.CmbServer.Text = $last } } catch { } }
+elseif (Test-Path -LiteralPath $lastFile) { try { $last = "$(Get-Content -LiteralPath $lastFile -Raw)".Trim(); if (Test-ServerName $last) { $ui.CmbServer.Text = $last; $ui.CmbSource.Text = $last } } catch { } }
+if (Test-Path -LiteralPath $lastTarget) { try { $last = "$(Get-Content -LiteralPath $lastTarget -Raw)".Trim(); if (Test-ServerName $last) { $ui.CmbTarget.Text = $last } } catch { } }
 if ($SkipLiveTests) { $ui.ChkScan.IsChecked = $false }
+if ($CompareWith) { $ui.RbCompare.IsChecked = $true; $ui.CmbTarget.Text = $CompareWith; $ui.CmbSource.Text = $(if ($Baseline) { $Baseline } else { $DnsServer }) }
 
 $timer = [Windows.Threading.DispatcherTimer]::new()
 $timer.Interval = [TimeSpan]::FromMilliseconds(250)
 $timer.Add_Tick({
     try {
-        $ui.Bar.Value = $script:sync.Progress
-        if ($script:sync.Status) { Set-Status $script:sync.Status }
+        $s = $script:run.steps[$script:step]; $n = $script:run.steps.Count
+        $ui.Bar.Value = [int](($script:step * 100 + $script:sync.Progress) / $n)
+        if ($script:sync.Status) { Set-Status $(if ($s.label) { "$($s.label) - $($s.server): $($script:sync.Status)" } else { $script:sync.Status }) }
         if (-not $script:sync.Done) { return }
         $timer.Stop()
         try { [void]$script:job.EndInvoke($script:handle) } catch { }
         $script:job.Dispose(); $script:job = $null
-        Set-Busy $false
-        if ($script:sync.Error) { Set-Status "Error: $($script:sync.Error)" $true; return }
-        $script:report = Save-Report $script:sync.Json $script:srv $OutHtml
-        Show-Report 'Analysis completed. Dashboard opened in your browser.'
+        if ($script:sync.Error) {
+            Set-Busy $false
+            Set-Status $(if ($s.label) { "$($s.label) server $($s.server) could not be read:`r`n$($script:sync.Error)" } else { "Error: $($script:sync.Error)" }) $true
+            return
+        }
+        $script:run.results += $script:sync.Json
+        $script:step++
+        if ($script:step -lt $n) { Start-Step; return }
+        Complete-Run
     } catch { $timer.Stop(); Set-Busy $false; Set-Status "Error: $($_.Exception.Message)" $true }
 })
 
 $ui.BtnRun.Add_Click({
     try {
-        $srv = "$($ui.CmbServer.Text)".Trim()
-        if (-not $srv) { Set-Status 'Enter the DNS server name.' $true; return }
-        if ($srv -notmatch '^[A-Za-z0-9_][A-Za-z0-9._:-]{0,252}$') { Set-Status 'Invalid server name: use only letters, digits, dots, hyphens (or an IP address).' $true; return }
-        try { if (-not (Test-Path $cfgDir)) { [void](New-Item $cfgDir -ItemType Directory) }; Set-Content $lastFile $srv } catch { }
-        Set-Busy $true
-        $script:srv    = $srv
-        $script:sync   = [hashtable]::Synchronized(@{ Status = 'Starting analysis...'; Progress = 0; Done = $false; Error = $null; Json = $null })
-        $script:job    = [powershell]::Create()
-        [void]$script:job.AddScript($Collector.ToString()).AddArgument($srv).AddArgument([bool]$ui.ChkScan.IsChecked).AddArgument($ExternalName).AddArgument($script:sync)
-        $script:handle = $script:job.BeginInvoke()
-        $timer.Start()
+        try { $plan = Get-RunPlan } catch { Set-Status $_.Exception.Message $true; return }
+        try {
+            if (-not (Test-Path $cfgDir)) { [void](New-Item $cfgDir -ItemType Directory) }
+            if ($plan.mode -eq 'analyze') { Set-Content -LiteralPath $lastFile $plan.name }
+            else { Set-Content -LiteralPath $lastTarget $plan.target; if ($plan.source) { Set-Content -LiteralPath $lastFile $plan.source } }
+        } catch { }
+        # same inputs as the last completed run (not a demo): update the same report file
+        if ($script:lastSig -and $plan.sig -eq $script:lastSig -and $script:lastPath -and (Test-Path -LiteralPath $script:lastPath)) { $plan.path = $script:lastPath; $plan.reused = $true }
+        Start-Run $plan
     } catch { Set-Busy $false; Set-Status "Error: $($_.Exception.Message)" $true }
 })
 $ui.BtnDemo.Add_Click({
+    $cmp = [bool]$ui.RbCompare.IsChecked
+    Start-Run @{ demo = $true; mode = $(if ($cmp) { 'compare' } else { 'analyze' }); name = $(if ($cmp) { 'DEMO-COMPARE' } else { 'DEMO' }); steps = @() }
+})
+$ui.BtnBrowse.Add_Click({
     try {
-        $script:report = Save-Report ((New-DemoData) | ConvertTo-Json -Depth 8 -Compress) 'DEMO' $null
-        Show-Report 'Demo dashboard opened in your browser (fictitious data).'
+        $dlg = [Microsoft.Win32.OpenFileDialog]::new()
+        $dlg.Filter = 'DNS Analyzer baseline or report (*.json;*.html;*.htm)|*.json;*.html;*.htm'; $dlg.Title = 'Choose a baseline or a report saved with DNS Analyzer'
+        if ($dlg.ShowDialog($win)) { $ui.CmbSource.Text = $dlg.FileName }
+    } catch { Set-Status "Error: $($_.Exception.Message)" $true }
+})
+$ui.BtnBaseline.Add_Click({
+    try {
+        if (-not $script:lastJson) { return }
+        $dlg = [Microsoft.Win32.SaveFileDialog]::new()
+        $dlg.Filter = 'DNS Analyzer baseline (*.json)|*.json'
+        $dlg.FileName = "DnsBaseline_{0}_{1}.json" -f ($script:lastServer -replace '[^\w.-]', '_'), (Get-Date -Format yyyyMMdd_HHmm)
+        if ($dlg.ShowDialog($win)) { Set-Status "Baseline saved to $(Save-Baseline $script:lastJson $script:lastServer $dlg.FileName). Use it later as the source of a comparison." }
     } catch { Set-Status "Error: $($_.Exception.Message)" $true }
 })
 $ui.BtnOpen.Add_Click({
@@ -1378,11 +1990,12 @@ $ui.BtnSave.Add_Click({
         $dlg = [Microsoft.Win32.SaveFileDialog]::new()
         $dlg.Filter = 'HTML dashboard (*.html)|*.html'; $dlg.FileName = [IO.Path]::GetFileName($script:report)
         if ($dlg.ShowDialog($win)) {
-            if ($dlg.FileName -ne $script:report) { Copy-Item $script:report $dlg.FileName -Force }
+            if ($dlg.FileName -ne $script:report) { Copy-Item -LiteralPath $script:report -Destination $dlg.FileName -Force }
             Set-Status "Saved to $($dlg.FileName)"
         }
     } catch { Set-Status "Error: $($_.Exception.Message)" $true }
 })
 $win.Add_Closing({ if ($script:job) { try { $script:job.Stop(); $script:job.Dispose() } catch { } } })
 
+Set-Mode
 [void]$win.ShowDialog()

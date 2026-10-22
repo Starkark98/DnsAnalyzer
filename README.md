@@ -7,7 +7,7 @@
 
 # DNS Analyzer *by Starkark98*
 
-![Version](https://img.shields.io/badge/version-1.0.0-059669)
+![Version](https://img.shields.io/badge/version-1.1.0-059669)
 ![PowerShell](https://img.shields.io/badge/PowerShell-5.1-5391FE?logo=powershell&logoColor=white)
 ![Platform](https://img.shields.io/badge/platform-Windows-0078D6)
 ![Read-only](https://img.shields.io/badge/server%20changes-none%20(read--only)-16a34a)
@@ -33,6 +33,7 @@ DNS Analyzer is the companion of [DHCP Analyzer](https://github.com/Starkark98/D
 - [Requirements](#requirements)
 - [Quick start](#quick-start)
 - [Guided tour of the dashboard](#guided-tour-of-the-dashboard)
+- [Compare two servers](#compare-two-servers)
 - [What the issues mean](#what-the-issues-mean)
 - [Command line](#command-line)
 - [Scheduled reports](#scheduled-reports)
@@ -66,6 +67,8 @@ DNS Analyzer reads the whole server, cross-checks the zones against each other, 
 - **Stale record detection**: dynamic records older than the zone's aging window (or 14 days when aging is off), with the classic misconfigurations flagged: aging on but server scavenging off, scavenging on but no zone with aging, scavenging that never ran.
 - **Cross-zone consistency checks**: CNAME, MX, SRV and NS records pointing to names that do not exist, A records without a PTR, PTR records pointing to the wrong name, several names sharing the same IP (often a stale record), private subnets without a reverse zone.
 - **Live tests** (optional): recursion and authoritative answers of the server, domain controller locator records, every forwarder and conditional forwarder, every name server of every zone (does it answer? same SOA serial?), and a **liveness check of static and stale A records** (ping, common TCP ports, ARP) to find records pointing to hosts that are gone.
+- **Compare two servers**, or a server with a **baseline** or an analysis **report** saved earlier: zones, records, settings, forwarders, policies, partitions and DNSSEC side by side, with a verdict and every difference classified by severity. Made for migrations to a new DNS server.
+- **Policies, partitions and DNSSEC**: DNS policies (server and zone level), client subnets, zone and recursion scopes, Active Directory partitions (is this server enlisted?), signing keys and their rollover, trust points, delegations and their name servers, and every server setting in one filterable list.
 - **Security checks**: nonsecure dynamic updates, zone transfers to any server, a server-level plugin DLL (a known privilege-escalation technique), cache pollution protection, global query block list.
 - **Logs and events of the last 7 days**: daily activity from the DNS audit log (dynamic updates, manual record changes, zone and server changes, scavenging), **who changed what**, and DNS Server errors and warnings from the event log, grouped, counted and explained.
 - **Server statistics** since the service started: queries, NXDOMAIN, SERVFAIL, recursion failures, dynamic updates, zone transfers.
@@ -106,7 +109,7 @@ Install-WindowsFeature RSAT-DNS-Server
 
 ## Quick start
 
-1. **Download** the ZIP of the latest version from the **Releases** section of this repository and extract it to any folder. If you want, compare its SHA-256 hash with the one published in the release notes (`Get-FileHash .\DnsAnalyzer-v1.0.0.zip`).
+1. **Download** the ZIP of the latest version from the **Releases** section of this repository and extract it to any folder. If you want, compare its SHA-256 hash with the one published in the release notes (`Get-FileHash .\DnsAnalyzer-v1.1.0.zip`).
 2. **Unblock** the files. Windows marks downloaded files as untrusted; run this once in PowerShell, in the extracted folder:
    ```powershell
    Get-ChildItem -Recurse | Unblock-File
@@ -114,7 +117,7 @@ Install-WindowsFeature RSAT-DNS-Server
 3. **Double-click `Start DnsAnalyzer.cmd`.** Accept the administrator prompt (UAC), or decline it if your account already has the required rights.
 4. **Choose the DNS server.** The domain controllers of your domain and the DNS servers configured on your PC are listed in the drop-down; you can also type a name or an IP address.
 5. Leave **"Run live tests"** ticked if you want the name server, forwarder and liveness checks (read [Responsible use](#responsible-use) first), then click **Analyze**.
-6. When the analysis is complete the dashboard opens in your browser. Use **Save as...** to keep a copy.
+6. When the analysis is complete the dashboard opens in your browser. Use **Save as...** to keep a copy and **Save baseline...** to keep the data for a later [comparison](#compare-two-servers). Clicking **Analyze** again with the same inputs updates the same report file.
 
 ![Launcher window](docs/images/01-launcher.png)
 
@@ -145,6 +148,9 @@ One row per zone. The dot on the left is the zone's worst issue (green means no 
 - **Problems**: what the cross-zone checks found in this zone (dangling CNAMEs, missing targets, missing PTRs, duplicate IPs, PTR mismatches).
 - **Name servers**: each NS of the zone, its IP, whether it answers for the zone and with which SOA serial. For conditional forwarders: each forwarder server and its answer.
 - **Liveness**: the result of the liveness check (see below).
+- **Delegations** (when the zone delegates subdomains): each delegated name server, its glue record and, with the live tests, whether it answers for the subdomain.
+- **DNSSEC** (signed zones): signing keys with their state and next rollover, and the zone signing settings.
+- **Policies** (when present): zone scopes and zone-level DNS policies.
 
 ![Records tab filtered on stale records](docs/images/04-zone-records.png)
 
@@ -182,14 +188,45 @@ What happened in the **last 7 days** (today and the six previous days), from two
 - **DNS audit log** (`Microsoft-Windows-DNSServer/Audit`): one row per day with dynamic updates, manual record changes, scavenged records, zone changes and server changes. Below, every change made by an administrator, with time, zone, **user** and details: the quickest way to answer "who deleted that record?".
 - **DNS Server event log**: critical events, errors and warnings, grouped by event ID with count, first and last occurrence, message and, for the best-known events, a short hint on what to check.
 
-### 9. Statistics and server configuration
+### 9. Policies, partitions and DNSSEC
 
-Collapsed by default. **Statistics** shows the server counters since the DNS service started (queries, NXDOMAIN and SERVFAIL rates, recursion failures and timeouts, dynamic updates, zone transfers), with the full list of counters below. **Server configuration** shows the DNS Server service state, version, listening addresses, recursion, scavenging, cache, global query block list, response rate limiting, DNSSEC validation, debug logging and server-level plugin DLL.
+Active Directory partitions (and whether this server is enlisted in them), DNS policies of the server and of every zone, client subnets, recursion and zone scopes, response rate limiting exceptions and DNSSEC trust points. Policies, scopes and client subnets exist on Windows Server 2016 and later.
+
+### 10. Statistics and server configuration
+
+Collapsed by default. **Statistics** shows the server counters since the DNS service started (queries, NXDOMAIN and SERVFAIL rates, recursion failures and timeouts, dynamic updates, zone transfers), with the full list of counters below. **Server configuration** shows the DNS Server service state, version, listening addresses, recursion, scavenging, cache, global query block list, response rate limiting, DNSSEC validation, debug logging and server-level plugin DLL, then **All settings**: every server-level setting (server, recursion, forwarders, cache, scavenging, EDNS, Active Directory, global names zone, diagnostics) in one filterable list.
 
 Use **Expand all** and **Collapse all** in the top bar to open or close every section. The dashboard follows your system's light or dark theme:
 
 ![Dark mode](docs/images/07-dark-mode.png)
 
+## Compare two servers
+
+Moving DNS to a new server (a new domain controller, a new Windows Server version, a consolidation)? Choose **Compare two servers (migration)** in the window:
+
+- **Source (old)**: the server you are leaving, by name. Or a file chosen with the **Baseline...** button: a **baseline** saved earlier with **Save baseline...** (after an analysis) or `-SaveBaseline`, or the **report of an analysis** (`.html`) made by DNS Analyzer, so that you can also compare a server with **how it was before** a change, or keep a copy of a server you are about to switch off.
+- **Target (new)**: the server that must take over.
+
+![Compare mode in the window](docs/images/09-launcher-compare.png)
+
+DNS Analyzer reads the configuration of both (zones, records, server settings, forwarders, root hints, policies, partitions, DNSSEC; no logs, no statistics and no live tests) and opens a comparison dashboard:
+
+![Comparison dashboard](docs/images/10-compare.png)
+
+- **Verdict** at the top: *Equivalent*, *Review the differences* or *Not equivalent*.
+- **Differences**: one row per difference, with severity, category, object, item and the source and target values. Filter by severity or category, sort by any column, or type in the search box.
+- **Zones**: every zone with its status (*identical*, *different*, *only on source*, *only on target*) and how many differences it has. Click a zone to show only its differences.
+- **Sources**: what was compared, when it was collected, and from which version of the tool.
+
+| Severity | Meaning | Examples |
+|---|---|---|
+| Critical | Present on the source and **missing on the target** | a zone, a static record, a forwarder, a conditional forwarder, a DNS policy, a client subnet, an AD partition |
+| Warning | **Different** on the two servers | dynamic updates, aging, zone transfers, scavenging, a CNAME pointing elsewhere, a setting |
+| Info | **Only on the target**, or cosmetic | server name, IP addresses, version, a new zone, a TTL, record counts |
+
+Dynamic records are summarized per zone (*N dynamic records only on the source*): clients and DHCP register them again on the new server, so they are not reported one by one. The SOA serial and the server name inside SOA/NS records naturally differ and are shown as info.
+
+Clicking **Compare** (or **Analyze**) again with the same inputs updates the same report file, which is handy while you fix things on the target: reload the browser tab (F5) if it is still open. A report made by DNS Analyzer 1.0 can be the source too: the data that version did not collect (all settings, partitions, policies, client subnets, scopes, rate limiting exceptions, DNSSEC keys and trust points) is then not compared, and the dashboard says so.
 ## What the issues mean
 
 The suggestions below are general guidance, not instructions for your specific environment: always evaluate them against your own network design and change-management process.
@@ -213,6 +250,9 @@ The suggestions below are general guidance, not instructions for your specific e
 | Warning | SOA serial differs (file-based zones) | A secondary server is not up to date: check zone transfers and notifications |
 | Warning | Dangling CNAME, MX/SRV or NS pointing to missing names | The record points to a name that does not exist in a zone hosted on this server: fix or delete it. SRV records of decommissioned domain controllers are a classic case |
 | Warning | Domain controller locator test failed | Clients cannot find a domain controller through DNS: check the `_msdcs` zone and the Netlogon service on the DCs |
+| Warning | Lame delegation | The name servers of a delegated subdomain do not answer for it: names in that subdomain cannot be resolved |
+| Warning | DNSSEC: missing KSK/ZSK, or rollover overdue | A signed zone without both keys, or with a key past its planned rollover, risks validation failures for clients that check DNSSEC |
+| Warning | Directory partition not enlisted | This domain controller does not hold that DNS application partition, so the AD-integrated zones stored there are not loaded on it |
 | Info | SOA serial differs (AD-integrated zones) | Normal for a short time; if it persists, check Active Directory replication |
 | Info | Records eligible for scavenging | Stale records that the next scavenging cycle will remove |
 | Info | A records without PTR / PTR mismatches | Reverse lookups return nothing or the wrong name: some applications and logs rely on them |
@@ -222,12 +262,14 @@ The suggestions below are general guidance, not instructions for your specific e
 | Info | Only one name server for a zone | No redundancy for that zone |
 | Info | Manual changes in the last 7 days | Not a problem in itself: a pointer to the audit log when something stopped working |
 | Info | Debug logging enabled | It can affect performance and fill the disk: disable it when you are done |
+| Info | DNS policies configured | Answers can depend on the client subnet, time of day or interface: keep it in mind when two clients get different answers |
 | Info | Logs could not be read | Missing permissions or firewall rule: see [Requirements](#requirements) |
 
 ## Command line
 
 ```powershell
 .\DnsAnalyzer.ps1 [-DnsServer <name>] [-NoGui] [-SkipLiveTests] [-ExternalName <name>] [-Demo] [-OutHtml <path>] [-NoElevate] [-NoOpen]
+                  [-CompareWith <name>] [-Baseline <file.json|report.html>] [-SaveBaseline <file.json>] [-DemoCompare]
 ```
 
 | Parameter | Description |
@@ -240,12 +282,23 @@ The suggestions below are general guidance, not instructions for your specific e
 | `-OutHtml` | Where to save the dashboard: a `.html` / `.htm` file, or a folder (the default file name is used). Default: `%TEMP%`. Missing folders are created; an existing file is overwritten |
 | `-NoElevate` | Does not ask for administrator rights at startup |
 | `-NoOpen` | Saves the dashboard without opening the browser: use it with `-NoGui` in scheduled tasks |
+| `-CompareWith` | Target (new) server of a comparison. The source (old) is `-DnsServer` or `-Baseline` |
+| `-Baseline` | Source of a comparison saved earlier: a baseline (`.json`) or an analysis report of DNS Analyzer (`.html`) |
+| `-SaveBaseline` | After an analysis, also saves its data as a baseline (`.json`) for later comparisons |
+| `-DemoCompare` | Builds a comparison dashboard from two sample servers |
 
 Examples:
 
 ```powershell
 # Report saved to a share, without live tests and without opening the browser
 .\DnsAnalyzer.ps1 -DnsServer DC01 -NoGui -NoOpen -SkipLiveTests -OutHtml "\\fileserver\it\dns\dc01.html"
+
+# Migration check: old server against the new one
+.\DnsAnalyzer.ps1 -DnsServer DC01 -CompareWith DNS-NEW01 -NoGui
+
+# Baseline today, comparison after the change
+.\DnsAnalyzer.ps1 -DnsServer DC01 -NoGui -NoOpen -SaveBaseline "C:\Reports\dc01-before.json"
+.\DnsAnalyzer.ps1 -Baseline "C:\Reports\dc01-before.json" -CompareWith DC01 -NoGui
 
 # Demo
 .\DnsAnalyzer.ps1 -Demo
@@ -265,7 +318,7 @@ The report at `-OutHtml` is overwritten at every run. With `-NoGui`, an error en
 
 DNS Analyzer is a single Windows PowerShell script. When you click **Analyze** it:
 
-1. **Reads the DNS server** with the read-only cmdlets of the Microsoft `DnsServer` module: `Get-DnsServerZone`, `Get-DnsServerResourceRecord`, `Get-DnsServerZoneAging`, `Get-DnsServerSetting`, `Get-DnsServerRecursion`, `Get-DnsServerForwarder`, `Get-DnsServerRootHint`, `Get-DnsServerScavenging`, `Get-DnsServerCache`, `Get-DnsServerGlobalQueryBlockList`, `Get-DnsServerResponseRateLimiting`, `Get-DnsServerDiagnostics`, `Get-DnsServerStatistics`.
+1. **Reads the DNS server** with the read-only cmdlets of the Microsoft `DnsServer` module: `Get-DnsServerZone`, `Get-DnsServerResourceRecord`, `Get-DnsServerZoneAging`, `Get-DnsServerSetting`, `Get-DnsServerRecursion`, `Get-DnsServerForwarder`, `Get-DnsServerRootHint`, `Get-DnsServerScavenging`, `Get-DnsServerCache`, `Get-DnsServerGlobalQueryBlockList`, `Get-DnsServerResponseRateLimiting`, `Get-DnsServerDiagnostics`, `Get-DnsServerStatistics`, `Get-DnsServerEDns`, `Get-DnsServerDsSetting`, `Get-DnsServerGlobalNameZone`, `Get-DnsServerDirectoryPartition`, `Get-DnsServerQueryResolutionPolicy`, `Get-DnsServerZoneTransferPolicy`, `Get-DnsServerClientSubnet`, `Get-DnsServerZoneScope`, `Get-DnsServerRecursionScope`, `Get-DnsServerResponseRateLimitingExceptionlist`, `Get-DnsServerDnsSecZoneSetting`, `Get-DnsServerSigningKey`, `Get-DnsServerTrustPoint`.
 2. **Reads service state and logs**: `Get-Service` for the DNS Server service and `Get-WinEvent` for the `DNS Server` and `Microsoft-Windows-DNSServer/Audit` event logs.
 3. **Cross-checks the data** in the dashboard itself: stale records, dangling names, PTR consistency, duplicate addresses, reverse zone coverage.
 4. **Optionally runs live tests** from your PC with `Resolve-DnsName`: recursion, authoritative answer and DC locator queries to the analyzed server, one query to each forwarder and each conditional forwarder, an SOA query (without recursion) to each name server of each zone. Then it checks the addresses of static and stale A records with ICMP ping (2 passes, 1 s timeout), TCP connection attempts on ports 22, 53, 80, 135, 443, 445, 3389 and 9100 (1 s timeout, no data sent) and the local ARP table.
@@ -301,8 +354,9 @@ DNS Analyzer is an administration tool intended for **IT staff analyzing infrast
 - **Large zones**: up to 30,000 records per zone are included in the report (the counts in the zone list refer to those). Very large zones make the report bigger and slower to build.
 - **Live tests**: up to 300 zones for the name server check and up to 4,096 addresses (1,024 per zone) for the liveness check. ARP works only for subnets the PC running the tool is directly connected to.
 - **Logs**: up to 2,000 events of the DNS Server log and 20,000 events of the audit log; the latest 500 administrator changes are listed.
-- **DNS policies, zone scopes and DNSSEC keys** are not analyzed (only whether a zone is signed).
-- **One server per run**: with AD-integrated zones, every domain controller has the same zones; analyze each DNS server separately to compare their settings.
+- **DNS policies, scopes and client subnets** are listed and compared, but the tool does not simulate which answer a given client receives.
+- **Comparisons** cover the configuration only (no logs, statistics or live tests). Servers are matched by zone name; up to 3,000 record differences are listed. Baselines from an older version are compared on the data they contain.
+- **One server per analysis**: with AD-integrated zones, every domain controller has the same zones; use [Compare two servers](#compare-two-servers) to check two of them side by side.
 - **Windows PowerShell 5.1** is required; PowerShell 7 is not supported.
 
 ## Troubleshooting
@@ -320,7 +374,7 @@ DNS Analyzer is an administration tool intended for **IT staff analyzing infrast
 | "Event log could not be read" | Add your account to **Event Log Readers** on the server and enable the firewall rule group **Remote Event Log Management** |
 | "Audit log could not be read" | Same as above; on Windows Server 2012 R2 the audit channel requires update KB2956577 |
 | All live tests fail with "No answer" | Your PC cannot reach the server on port 53 (firewall), or the server does not listen on the address you used |
-| Liveness shows many "No response" that you know are used | Devices may be off or firewalled. Run again at a busy time, from a PC on the same subnet |
+| Liveness shows many "No response" that you know are used | Devices may be off or firewalled. Analyze again at a busy time, from a PC on the same subnet |
 | The analysis is slow | Large zones and many name servers take time. Use `-SkipLiveTests` for a quicker report |
 | Antivirus or EDR warns about the script | The launcher starts PowerShell hidden with `-ExecutionPolicy Bypass` and the live tests probe TCP ports: both are typical of admin tools. Review the source, then ask your security team to allow it, or run with `-SkipLiveTests` |
 
@@ -336,7 +390,13 @@ No. It shows you what would be removed and why, so that you can decide.
 Yes: replication scope, secure dynamic updates and the domain controller locator records are analyzed. Run it against one domain controller; run it again against another DC to compare server settings.
 
 **Can I analyze several servers?**
-Run it once per server. Each report is a separate file.
+Run it once per server. Each report is a separate file. To check two servers against each other, use [Compare two servers](#compare-two-servers).
+
+**How do I refresh a report?**
+Click **Analyze** (or **Compare**) again with the same inputs: the same report file is updated. Reload the browser tab (F5) if it is still open.
+
+**Can I check that nothing changed on a server?**
+Yes: after an analysis click **Save baseline...** (or use `-SaveBaseline`), or simply keep its report. Later, compare the baseline or the report with the same server: every change since then is listed.
 
 **Is it really free?**
 Yes, to use. Individuals and organizations of any kind, companies included, can use it on their own networks at no cost. What is not allowed is **selling** it, or selling products or services based on it: see [License](#license). If it saves you time, consider giving the project a star on GitHub or [supporting it on Ko-fi](#support-the-project).
@@ -418,4 +478,4 @@ Because of the Commons Clause, DNS Analyzer is **source-available** software, no
 
 ---
 
-*DNS Analyzer by **Starkark98** · v1.0.0 · see the [changelog](CHANGELOG.md)*
+*DNS Analyzer by **Starkark98** · v1.1.0 · see the [changelog](CHANGELOG.md)*

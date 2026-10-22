@@ -16,11 +16,11 @@ Paste the full message shown in the window (you can select and copy it), or the 
 ```
 
 **Environment**
-- DNS Analyzer version (shown in the window next to the title, e.g. v1.0.0):
+- DNS Analyzer version (shown in the window next to the title, e.g. v1.1.0):
 - Windows version of the PC running the tool:
 - Windows Server version of the DNS server:
 - Run as administrator: yes / no
-- Live tests enabled: yes / no
+- Mode: Analyze (live tests enabled: yes / no) / Compare (source: server, baseline .json or report .html)
 - DNS server is a domain controller (AD-integrated zones): yes / no
 
 **Steps to reproduce**
